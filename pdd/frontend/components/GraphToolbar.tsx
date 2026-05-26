@@ -13,10 +13,16 @@ interface GraphToolbarProps {
   canUndo: boolean;
   canRedo: boolean;
   isSaving?: boolean;
-  onSyncFromPrompts?: () => void;  // New prop for sync button
+  onSyncFromPrompts?: () => void;
   onRearrange?: () => void;
   isRearranging?: boolean;
   onManageGroups?: () => void;
+  // Context audit props
+  selectedModel: string;
+  availableModels: string[];
+  onModelChange: (model: string) => void;
+  sortMode: 'priority' | 'context-pressure';
+  onToggleSortMode: () => void;
 }
 
 const GraphToolbar: React.FC<GraphToolbarProps> = ({
@@ -35,6 +41,11 @@ const GraphToolbar: React.FC<GraphToolbarProps> = ({
   onRearrange,
   isRearranging = false,
   onManageGroups,
+  selectedModel,
+  availableModels,
+  onModelChange,
+  sortMode,
+  onToggleSortMode,
 }) => {
   return (
     <div className="flex items-center gap-2 px-3 py-2 bg-surface-800/80 border-b border-surface-700/50">
@@ -54,6 +65,37 @@ const GraphToolbar: React.FC<GraphToolbarProps> = ({
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
           </svg>
           <span>{editMode ? 'Editing' : 'Edit'}</span>
+        </button>
+      </Tooltip>
+
+      <div className="w-px h-6 bg-surface-700" />
+
+      {/* Model Selection Dropdown (always visible) */}
+      <div className="flex items-center gap-2">
+        <span className="text-[10px] uppercase font-bold text-surface-500">Model</span>
+        <select
+          value={selectedModel}
+          onChange={(e) => onModelChange(e.target.value)}
+          className="bg-surface-900 text-surface-200 text-xs border border-surface-700 rounded px-2 py-1 focus:outline-none focus:border-accent-500"
+        >
+          {availableModels.map(m => (
+            <option key={m} value={m}>{m}</option>
+          ))}
+        </select>
+      </div>
+
+      <div className="w-px h-6 bg-surface-700" />
+
+      {/* Sort Mode Toggle */}
+      <Tooltip content={`Sort by ${sortMode === 'priority' ? 'Context Pressure' : 'Priority'}`}>
+        <button
+          onClick={onToggleSortMode}
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-surface-700 text-surface-300 hover:bg-surface-600 transition-colors"
+        >
+          <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 4h13M3 8h9m-9 4h6m4 0l4-4m0 0l4 4m-4-4v12" />
+          </svg>
+          <span>Sort: {sortMode === 'priority' ? 'Priority' : 'Pressure'}</span>
         </button>
       </Tooltip>
 

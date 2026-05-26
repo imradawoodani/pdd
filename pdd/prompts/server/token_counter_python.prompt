@@ -1,4 +1,19 @@
-<pdd-reason>Utility for counting tokens in prompt strings for cost estimation.</pdd-reason>
+<pdd-reason>Utility for counting tokens, estimating costs, and auditing prompt context window health with persistent caching.</pdd-reason>
+<pdd-interface>
+{
+  "type": "module",
+  "module": {
+    "functions": [
+      {"name": "count_tokens", "signature": "(text: str, model: str = \"gpt-4o\") -> int", "returns": "int"},
+      {"name": "get_context_limit", "signature": "(model: str) -> Optional[int]", "returns": "Optional[int]"},
+      {"name": "estimate_cost", "signature": "(token_count, model, pricing_csv) -> Optional[CostEstimate]", "returns": "Optional[CostEstimate]"},
+      {"name": "get_token_metrics", "signature": "(text, model, pricing_csv) -> TokenMetrics", "returns": "TokenMetrics"},
+      {"name": "get_tree_hash", "signature": "(prompt_path: str) -> str", "returns": "str"},
+      {"name": "get_context_audit", "signature": "(prompt_path: str, model: str) -> ContextAudit", "returns": "ContextAudit"}
+    ]
+  }
+}
+</pdd-interface>
 
 % You are an expert Python engineer. Create a `token_counter` module for token counting and cost estimation.
 
@@ -18,17 +33,34 @@ A utility module that counts tokens and looks up model context windows using lit
    - Do NOT use a hardcoded MODEL_CONTEXT_LIMITS dict
 3. Function: `estimate_cost(token_count, model, pricing_csv) -> Optional[CostEstimate]`
 4. Function: `get_token_metrics(text, model, pricing_csv) -> TokenMetrics` combining all metrics
-5. Dataclass `CostEstimate`: input_cost, model, tokens, cost_per_million, currency (default USD)
-6. Dataclass `TokenMetrics`: token_count, context_limit (Optional[int]), context_usage_percent (Optional[float]), cost_estimate
-7. Both dataclasses have `to_dict()` methods for serialization
-8. Pricing loaded from CSV with columns: model, input (cost per million tokens)
-9. Model matching for cost: exact match first, then partial/substring match, then fallback to defaults
-10. Cache pricing data with lru_cache; do NOT cache litellm calls (litellm has its own cache)
-11. Return None for cost estimate if pricing CSV missing or model not found
+5. Use Pydantic models from `pdd.server.models` for `CostEstimate`, `TokenMetrics`, `TokenBreakdown`, and `ContextAudit`.
+6. Pricing loaded from CSV with columns: model, input (cost per million tokens).
+7. Model matching for cost: exact match first, then partial/substring match, then fallback to defaults.
+8. Cache pricing data with lru_cache; do NOT cache litellm calls (litellm has its own cache).
+9. Return None for cost estimate if pricing CSV missing or model not found.
+10. Function: `get_tree_hash(prompt_path: str) -> str`: recursively compute SHA-256 of the prompt file, all files referenced via `<include>` and `<include-many>` tags, and any associated test or example files discovered by convention to detect any change in the dependency tree. Associated files are defined as files related to the prompt file by name (e.g., stripping language suffixes like `_python` or `_typescript` and supporting patterns like `test_{name}.py` or `{name}_test.ts`) found anywhere within the `tests/`, `context/`, or `examples/` directories of the project.
+11. Function: `get_context_audit(prompt_path: str, model: str) -> ContextAudit`:
+    - Calculate the tree hash for the prompt.
+    - Check SQLite cache at `.pdd/cache/context_audit.db` using a composite key of `(tree_hash, model)`.
+    - If cache miss:
+        - Identify all content sources: the original prompt body, all `<include>`/`<include-many>` targets, and all `<web>` grounding targets.
+        - For `<web>` grounding targets, avoid live network calls during audits; use a heuristic estimate (e.g., 500 tokens) or cached metadata if available.
+        - Calculate `TokenMetrics` including a heuristic `breakdown` by tokenizing each content source individually *before* full hydration and summing them up according to their category:
+            - **Tests**: content from files in `tests/` or with `_test` / `.test` suffixes.
+            - **Examples**: content from files in `examples/`.
+            - **Grounding**: content from files in `context/` or retrieved via `<web>` tags.
+            - **Includes**: content from other `<include>`/`<include-many>` tags that don't match the above categories.
+            - **Body**: the raw text of the `.prompt` file itself.
+        - The total `token_count` should be the count of the fully hydrated (preprocessed) prompt, which may differ slightly from the sum of parts due to token boundary overlaps.
+        - Store result in SQLite.
+    - Return consolidated audit data.
 
 % Dependencies
 - litellm: for token counting and context window lookup (primary)
 - tiktoken: fallback for token counting only
+- sqlite3: for persistent context audit caching
+- pdd.preprocess: for hydrating prompts during audit
+- pdd.server.models: for CostEstimate, TokenMetrics, TokenBreakdown, ContextAudit
 - CSV file at .pdd/llm_model.csv for pricing data
 
 % Instructions

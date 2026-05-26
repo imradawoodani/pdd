@@ -38,7 +38,7 @@ Requirements
    - left label: formatted context limit (`<tokens> ctx`)
    - stacked segments: Input (blue), Thinking (purple), Output (green or orange warning)
    - widths from `inputPercent`, `thinkingPercent`, `outputPercent` derived from `contextLimit`
-   - segment tooltips include formatted token counts and one-decimal percentages
+   - segment tooltips include formatted token counts and one-decimal percentages; the Input segment tooltip also includes the detailed contributor breakdown (Body, Includes, Tests, Examples, Grounding) from `currentMetrics.breakdown` when available.
    - legend row for Input/Thinking/Output; append `(low)` and warning text color when output is low.
 9. Use responsive Tailwind dark-surface styling consistent with `PromptSpace` and keep inline SVG icons (no external icon package).
 

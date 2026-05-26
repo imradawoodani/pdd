@@ -1,4 +1,4 @@
-<pdd-reason>REST API endpoints for architecture.json validation and bidirectional sync with prompt files.</pdd-reason>
+<pdd-reason>REST API endpoints for architecture.json validation, bidirectional sync, and project-wide context window health auditing.</pdd-reason>
 
 <pdd-interface>
 {
@@ -8,7 +8,8 @@
       {"name": "validate_architecture", "signature": "(request: ValidateArchitectureRequest)", "returns": "ValidationResult"},
       {"name": "sync_from_prompts", "signature": "(request: SyncRequest)", "returns": "SyncResult"},
       {"name": "generate_tags_for_prompt", "signature": "(request: GenerateTagsRequest)", "returns": "GenerateTagsResult"},
-      {"name": "rearrange_graph_layout", "signature": "(request: RearrangeRequest)", "returns": "RearrangeResult"}
+      {"name": "rearrange_graph_layout", "signature": "(request: RearrangeRequest)", "returns": "RearrangeResult"},
+      {"name": "get_context_audit", "signature": "(model: str)", "returns": "ContextAuditResponse"}
     ]
   }
 }
@@ -17,6 +18,7 @@
 <pdd-dependency>architecture_sync_python.prompt</pdd-dependency>
 <pdd-dependency>agentic_common_python.prompt</pdd-dependency>
 <pdd-dependency>load_prompt_template_python.prompt</pdd-dependency>
+<pdd-dependency>token_counter_python.prompt</pdd-dependency>
 
 % You are an expert Python engineer. Your goal is to write `pdd/server/routes/architecture.py`.
 
@@ -72,72 +74,23 @@
      - `duplicate_dependency`: Module lists same dependency twice
      - `orphan_module`: Module has no connections (may be intentional)
 
+  8. **GET /architecture/context-audit**:
+     - Query parameters: `model` (the LLM model to use for token counting and context limits)
+     - Logic:
+       - Loads `architecture.json`.
+       - For each module in the architecture, calls `token_counter.get_context_audit` using the prompt path resolved via the project's configured `prompts_dir` (from `.pddrc`).
+       - Aggregates the results into a mapping of `filename -> ContextAudit` (using the module's `filename` as the key).
+     - Returns: `ContextAuditResponse` containing the project-wide audit.
+
 % Models
-  ```python
-  class ArchitectureModule(BaseModel):
-      reason: str
-      description: str
-      dependencies: List[str]
-      priority: int
-      filename: str
-      filepath: str
-      tags: List[str] = Field(default_factory=list)
-      interface: Optional[Dict[str, Any]] = None
+  Import the following Pydantic models from `pdd.server.models`:
+  `TokenBreakdown`, `TokenMetrics`, `ContextAudit`, `ContextAuditResponse`, `ArchitectureModule`, `ValidationError`, `ValidationWarning`, `ValidateArchitectureRequest`, `ValidationResult`, `SyncRequest`, `SyncResult`, `GenerateTagsRequest`, `GenerateTagsResult`, `RearrangeRequest`, `RearrangeResult`.
 
-  class ValidationError(BaseModel):
-      type: str  # circular_dependency, missing_dependency, invalid_field
-      message: str
-      modules: List[str]
-
-  class ValidationWarning(BaseModel):
-      type: str  # duplicate_dependency, orphan_module
-      message: str
-      modules: List[str]
-
-  class ValidateArchitectureRequest(BaseModel):
-      modules: List[ArchitectureModule]
-
-  class ValidationResult(BaseModel):
-      valid: bool  # True if no errors (warnings OK)
-      errors: List[ValidationError]
-      warnings: List[ValidationWarning]
-
-  class SyncRequest(BaseModel):
-      filenames: Optional[List[str]] = None  # None = sync all
-      dry_run: bool = False
-
-  class SyncResult(BaseModel):
-      success: bool
-      updated_count: int
-      skipped_count: int = 0
-      results: List[Dict[str, Any]]
-      validation: ValidationResult
-      errors: List[str] = Field(default_factory=list)
-
-  class GenerateTagsRequest(BaseModel):
-      prompt_filename: str
-
-  class GenerateTagsResult(BaseModel):
-      success: bool
-      tags: Optional[str] = None
-      has_existing_tags: bool = False
-      architecture_entry: Optional[Dict[str, Any]] = None
-      error: Optional[str] = None
-
-  class RearrangeRequest(BaseModel):
-      architecture_path: str = Field(
-          "architecture.json",
-          description="Path to architecture file, relative to project root"
-      )
-
-  class RearrangeResult(BaseModel):
-      success: bool
-      modules: Optional[List[Dict[str, Any]]] = None
-      message: Optional[str] = None
-      error: Optional[str] = None
-  ```
 
 % Dependencies
+  <token_counter_interface>
+    <include select="interface">pdd/prompts/server/token_counter_python.prompt</include>
+  </token_counter_interface>
   <architecture_sync>
     <include>context/architecture_sync_example.py</include>
   </architecture_sync>

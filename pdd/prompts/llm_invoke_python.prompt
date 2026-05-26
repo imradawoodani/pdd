@@ -287,9 +287,7 @@
 
 % Cloud API Documentation:
    <cloud_api_documentation>
-      <include>../docs/api-documentation.md</include>
    </cloud_api_documentation>
-
 % Multi-Credential Providers:
     - Providers like AWS Bedrock, Azure OpenAI, Google Vertex AI use pipe-delimited api_key fields.
     - litellm reads their env vars automatically by model prefix (bedrock/, azure/, vertex_ai/).

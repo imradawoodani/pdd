@@ -13,10 +13,11 @@
      - Use `rich.console.Console` with an ImportError fallback console that prints via builtins.
 
   2. Models:
-     - Define request/response Pydantic models for analyze, sync status, model catalog, match check, diff analysis, git history, and prompt diff endpoints.
-     - Diff models must include `PromptRange`, `CodeRange`, `DiffSection`, `LineMapping`, `HiddenKnowledgeLocation`, `HiddenKnowledge`, `DiffStats`, `DiffAnalysisResult`, `DiffAnalysisRequest`, `DiffAnalysisResponse`.
-     - `DiffAnalysisResult` includes `overallScore`, `canRegenerate`, `regenerationRisk`, `promptToCodeScore`, `codeToPromptScore`, `sections`, `codeSections`, `hiddenKnowledge`, `lineMappings`, `stats`, `missing`, `extra`, `suggestions`.
-     - Prompt diff response includes `version_a_label`, `version_b_label`, and `versions_swapped`.
+     - Import all necessary Pydantic models from `pdd.server.models` instead of re-defining them.
+     - These include: `TokenBreakdown`, `TokenMetrics`, `PromptAnalyzeResponse`, `PromptRange`, `CodeRange`, `DiffSection`, `LineMapping`, `HiddenKnowledgeLocation`, `HiddenKnowledge`, `DiffStats`, `DiffAnalysisResult`, `DiffAnalysisRequest`, `DiffAnalysisResponse`, `LinguisticChange`, `PromptDiffResponse`, `GitVersion`, `GitHistoryResponse`, `ModelInfo`, `ModelCatalogResponse`, `MatchCheckResponse`, `SyncStatusResponse`, `AnalyzeRequest`, `DiffAnalysisRequest`, `MatchCheckRequest`, `PromptDiffRequest`, `GitHistoryRequest`.
+     - `PromptAnalyzeResponse` must include `raw_metrics: TokenMetrics` and `processed_metrics: Optional[TokenMetrics]`.
+     - `DiffAnalysisResult` must provide detailed mappings for `canRegenerate`, `regenerationRisk`, and `hiddenKnowledge`.
+     - `PromptDiffResponse` must include `version_a_label`, `version_b_label`, and `versions_swapped`.
 
   3. `POST /analyze`:
      - Request: `path` (required), `model` default `claude-sonnet-4-20250514`, `preprocess` default true, optional direct `content`.

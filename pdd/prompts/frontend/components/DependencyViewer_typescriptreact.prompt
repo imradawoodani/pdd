@@ -8,10 +8,10 @@
 Requirements
 1. Export default `DependencyViewer` as `React.FC<DependencyViewerProps>` with props:
    - required: `architecture`, `prdContent`, `onModuleClick`
-   - optional: `appName`, `onRunSync`, `onGeneratePrompts`, `isGeneratingPrompts`, `existingPrompts`, `promptsInfo`
+   - optional: `appName`, `onRunSync`, `onGeneratePrompts`, `isGeneratingPrompts`, `existingPrompts`, `promptsInfo`, `contextAuditData`
    - edit-mode: `editMode`, `onModuleEdit`, `onModuleDelete`, `onDependencyAdd`, `onDependencyRemove`, `onPositionsChange`, `highlightedModules`, `onInitialPositionsCalculated`
    - batch-mode: `batches`, `selectedBatch`, `onBatchSelect`, `onSyncBatch`, `remainingCountByBatch`
-2. Keep defaults: `isGeneratingPrompts=false`, `existingPrompts=new Set()`, `promptsInfo=[]`, `editMode=false`, `highlightedModules=new Set()`, `batches=[]`, `selectedBatch=null`, `remainingCountByBatch=new Map()`.
+2. Keep defaults: `isGeneratingPrompts=false`, `existingPrompts=new Set()`, `promptsInfo=[]`, `contextAuditData={modules:{}}`, `editMode=false`, `highlightedModules=new Set()`, `batches=[]`, `selectedBatch=null`, `remainingCountByBatch=new Map()`.
 3. Keep `NODE_WIDTH=200`, `NODE_HEIGHT=85`.
 4. Implement `getCategory(module)` returning `'frontend' | 'backend' | 'shared'` from case-insensitive tags:
    - frontend tags: `frontend, react, nextjs, ui, page, component, css, html`
@@ -30,6 +30,7 @@ Requirements
    - nodes map each module to `Node<ModuleNodeData>` with id `filename`, type `moduleNode`, position from `m.position || {x:0,y:0}`, and data:
      - label stripped from filename by removing `_[A-Za-z]+.prompt` then `.prompt`
      - module, matching promptInfo, `hasPrompt`, category colors, click/sync/edit callbacks, highlight flag
+     - `contextAudit` from `contextAuditData.modules[m.filepath]`
      - batch metadata from `getBatchForModule(filename, batches)` (`batchId`, `batchColor`, `batchName`)
    - edges from each module dependency that exists in architecture (`dep -> module`), with:
      - id `${dep}->${module}`

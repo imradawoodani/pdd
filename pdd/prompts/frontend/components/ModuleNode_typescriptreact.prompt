@@ -1,3 +1,15 @@
+<pdd-reason>ReactFlow node card for displaying module metadata, prompt status, and context-window health metrics.</pdd-reason>
+<pdd-interface>
+{
+  "type": "frontend",
+  "frontend": {
+    "pages": [
+      {"name": "ModuleNode", "route": "Component"}
+    ]
+  }
+}
+</pdd-interface>
+
 % You are an expert TypeScript React engineer. Implement `pdd/frontend/components/ModuleNode.tsx`, a ReactFlow node card that displays module metadata, prompt status, and edit/sync controls.
 
 % Dependencies
@@ -8,7 +20,7 @@
 Requirements
 1. Import `React` and `memo`, `Handle`/`Position`/`NodeProps` from `reactflow`, `ArchitectureModule` + `PromptInfo` from `../api`, and `Tooltip` from `./Tooltip`.
 2. Export `ModuleNodeData` with:
-   - `label: string`, `module: ArchitectureModule`, optional `promptInfo?: PromptInfo`, `hasPrompt: boolean`
+   - `label: string`, `module: ArchitectureModule`, optional `promptInfo?: PromptInfo`, `hasPrompt: boolean`, optional `contextAudit?: ContextAudit`
    - `colors: { bg: string; border: string; hover: string; text: string }`
    - optional callbacks `onClick(module)`, `onRunSync(module)`, `onEdit(module)`, `onDelete(filename)`
    - optional flags `editMode?: boolean`, `isHighlighted?: boolean`
@@ -22,6 +34,7 @@ Requirements
 7. Wrap the node card in `Tooltip`. Tooltip content must show filename, filepath, and `description?.substring(0, 100)` plus ellipsis. When `hasPrompt` is true, include:
    - a "Prompt exists" row with check icon
    - check/cross statuses for Code/Test/Example with green/yellow/blue coloring for present items and muted styling when absent
+   - if `contextAudit` exists: show "Context Window: [percent]%" with color coding, and a breakdown of contributors (Body, Includes, Tests, Examples, Grounding) in a small grid or list.
 8. Main card is clickable and uses:
    - base classes for rounded bordered glass card, hover scale, `group`, and transitions
    - category classes from `colors.bg`, `colors.border`, `colors.hover`
@@ -39,7 +52,12 @@ Requirements
    - module type row from `module.interface?.type || 'module'` using `colors.text`
    - priority row `Priority: {module.priority}`
 14. Keep inline SVG icons for prompt check, edit, and sync controls as in-component markup.
-15. Export default `memo(ModuleNode)`.
+15. If `contextAudit` exists and has `metrics.context_usage_percent`, render a horizontal health bar at the bottom edge of the card:
+    - Height: 3px.
+    - Width: based on `context_usage_percent` (clamped to 100%).
+    - Background: `bg-emerald-500` (< 70%), `bg-amber-500` (70-90%), `bg-rose-500` (> 90%).
+    - Position: Absolute at bottom, `left-0`, `rounded-b-lg`.
+16. Export default `memo(ModuleNode)`.
 
 Deliverable
 - Output only `pdd/frontend/components/ModuleNode.tsx`.

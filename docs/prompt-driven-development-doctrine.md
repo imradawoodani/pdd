@@ -432,14 +432,14 @@ PDD's batch architecture eliminates operational overhead entirely:
 ├─────────────────────────────────────────────────────────────┤
 │  PDD ALLOCATION                                             │
 │  ┌─────────────────────────────────────────────────────┐   │
-│  │                                                     │   │
 │  │   Prompt  │  Grounding  │  Tests  │  Dependencies  │   │
 │  │                                                     │   │
 │  │            100% for Generation Task                 │   │
 │  │                                                     │   │
-│  └─────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+PDD now makes this structural advantage visible through **Context Health Visualization** in the Architecture View. By explicitly measuring and displaying the token "contributors" (body, includes, tests, etc.), PDD allows developers to treat context as a finite, optimizeable resource—much like memory or CPU in traditional systems.
 
 Every token in the PDD context window serves generation:
 - **Prompt**: Requirements, constraints, intent

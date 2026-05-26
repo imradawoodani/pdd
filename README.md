@@ -1099,7 +1099,7 @@ The command prints updated prompt entries and validation errors or warnings. It 
 
 ### 2. generate
 
-Create runnable code from a prompt file. This command produces the full implementation code that fulfills all requirements in the prompt. When changes are detected between the current prompt and its last committed version, it can automatically perform incremental updates rather than full regeneration.
+Create runnable code from a prompt file. This command produces the full implementation code that fulfills all requirements in the prompt. When changes are detected between the current prompt and its last committed version, it can automatically perform incremental updates rather than full regeneration. For architecture-driven projects, it also supports an experimental Incremental PRD Mode to apply validated patches to `architecture.json` and its associated prompts.
 
 ```bash
 # Basic usage
@@ -2877,6 +2877,7 @@ pdd checkup \
 The web interface provides:
 - **Command Execution**: Run any PDD command (`pdd change`, `pdd bug`, `pdd fix`, `pdd sync`, etc.) with visual feedback
 - **File Browser**: View and edit prompts, code, and tests in your project
+- **Architecture Visualization**: Real-time dependency graph with "context-window health" scores, hydrated token counting, and contributor breakdown analysis.
 - **Remote Access**: Access your session from any browser via PDD Cloud
 - **Session Management**: Run multiple sessions with custom names
 
@@ -3109,6 +3110,9 @@ PDD provides comprehensive help features:
 
 ## Additional Features
 
+- **Context Health Visualization**: Real-time monitoring of hydrated token counts and context-window usage (Green/Yellow/Red) directly in the ArchitectureView graph nodes.
+- **Token Breakdown Heuristics**: Detailed tooltips showing contributor breakdowns (Body, Includes, Tests, Examples, Grounding).
+- **Context Pressure Sorting**: Rank and sort architecture modules by their context window saturation.
 - **Tab Completion**: `pdd setup` installs tab completion automatically. If you only need to refresh the completion script, run `pdd install_completion` directly.
 - **Colorized Output**: PDD provides colorized output for better readability in compatible terminals.
 

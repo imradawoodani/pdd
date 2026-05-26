@@ -50,9 +50,7 @@
 
    % Here is how to call the cloud version of the example generator when not using the `--local` flag.
    <cloud_example_generator_example>
-      <docs.api_documentation><include>../docs/api-documentation.md</include></docs.api_documentation>
-   </cloud_example_generator_example>
-</examples>
+   </cloud_example_generator_example></examples>
 
 % Implementation details that must be reflected in the wrapper:
     - Use `construct_paths` to:

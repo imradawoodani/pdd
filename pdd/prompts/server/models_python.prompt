@@ -1,3 +1,13 @@
+<pdd-reason>Pydantic v2 models for the PDD server REST API, including file operations, job management, and context audit metrics.</pdd-reason>
+<pdd-interface>
+{
+  "type": "module",
+  "module": {
+    "functions": []
+  }
+}
+</pdd-interface>
+
 % You are an expert Python engineer. Your goal is to write `pdd/server/models.py`.
 
 % Role & Scope
@@ -42,12 +52,32 @@
      - `RemoteSessionInfo`: session_id (optional), cloud_url (optional, e.g., https://pdd.dev/connect/{session_id}), registered (bool), registered_at (optional datetime)
      - `SessionListItem`: session_id, cloud_url (cloud access URL), project_name, created_at, last_heartbeat, status, metadata
 
-  6. **Validation**:
+  6. **Context Audit Models**:
+     - `TokenBreakdown`: body, includes, tests, examples, grounding (all int)
+     - `CostEstimate`: input_cost (float), model (str), tokens (int), cost_per_million (float), currency (str)
+     - `TokenMetrics`: token_count, context_limit (Optional[int]), context_usage_percent (Optional[float]), cost_estimate (Optional[CostEstimate]), breakdown (Optional[TokenBreakdown])
+     - `ContextAudit`: prompt_path, tree_hash, metrics (TokenMetrics)
+     - `ContextAuditResponse`: modules (Mapping[str, ContextAudit])
+
+  7. **Architecture Models**:
+     - `ArchitectureModule`: reason, description, dependencies, priority, filename, filepath, tags, interface (Optional[Dict]), group (Optional[str])
+     - `ValidationError`: type, message, modules (List[str])
+     - `ValidationWarning`: type, message, modules (List[str])
+     - `ValidateArchitectureRequest`: modules (List[ArchitectureModule])
+     - `ValidationResult`: valid (bool), errors (List[ValidationError]), warnings (List[ValidationWarning])
+     - `SyncRequest`: filenames (Optional[List[str]]), dry_run (bool)
+     - `SyncResult`: success (bool), updated_count, skipped_count, results (List[Dict]), validation (ValidationResult), errors (List[str])
+     - `GenerateTagsRequest`: prompt_filename (str)
+     - `GenerateTagsResult`: success (bool), tags (Optional[str]), has_existing_tags (bool), architecture_entry (Optional[Dict]), error (Optional[str])
+     - `RearrangeRequest`: architecture_path (str)
+     - `RearrangeResult`: success (bool), modules (Optional[List[Dict]]), message (Optional[str]), error (Optional[str])
+
+  8. **Validation**:
      - Path fields should validate against directory traversal (no "..")
      - Use Field() for descriptions and constraints
      - Use field_validator for custom validation
 
-  7. **Serialization**:
+  8. **Serialization**:
      - datetime fields should serialize to ISO 8601 strings
      - Use timezone-aware datetime: `datetime.now(timezone.utc)` instead of deprecated `datetime.utcnow()`
      - Enums should serialize to string values

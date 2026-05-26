@@ -39,11 +39,11 @@ Successful fixes can contribute to grounding, but the prompt remains the source 
 - **Compilation:** Running `pdd sync` or related commands to regenerate conventional code artifacts from PDD source and validate them.
 - **Grounding (Few-Shot History):** The process where the PDD system can use successful past pairs of (Prompt, Code) as "few-shot" examples during generation. This helps regenerated code follow established style and logic, reducing the chance of a completely different implementation.
 - **Drift:** When the generated code slowly diverges from the prompt's intent over time, or when manual edits to code make it inconsistent with the prompt.
+- **Context Pressure:** The ratio of a prompt's hydrated token count to the model's maximum context window. High context pressure leads to reasoning degradation.
 
 ---
 
 ## Why PDD Prompts (Not Patches)
-
 - Prompts are the source of truth; code is a generated artifact. Update the prompt and regenerate instead of patching code piecemeal.
 - Regeneration preserves conceptual integrity and reduces long‑term maintenance cost (see pdd/docs/whitepaper.md).
 - Prompts consolidate intent, constraints, dependencies, and examples into one place so the model can use them during generation.
@@ -1507,6 +1507,26 @@ Use `pdd auto-deps` to automatically discover both code and documentation depend
 ### Token Efficiency
 
 Real source code is heavy. A 500-line module might have a 50-line usage example. By including only the example, you save ~90% of tokens. Use `pdd auto-deps` to automatically populate relevant examples and documentation references.
+
+### Context Window Health Visualization
+
+As your codebase grows, managing "context-window pressure" becomes critical. PDD Connect provides a visual dashboard in the **Architecture View** to help you identify modules approaching model context limits.
+
+#### How to use the Context Score
+1. **Node Health Bars**: Each prompt node in the graph displays a small bar indicating its token usage relative to the selected model's limit.
+   - **Healthy (Green)**: < 70% usage. The model has plenty of working memory for reasoning.
+   - **Warning (Yellow)**: 70-90% usage. Consider pruning non-essential `<include>` tags or shortening examples.
+   - **Critical (Red)**: > 90% usage. High risk of generation failures or hallucinations. Switch to a larger-context model or use `pdd auto-deps` to optimize dependencies.
+
+#### Identifying Token Contributors
+Hover over any module node to see a **Detailed Context Breakdown**:
+- **Prompt Body**: The raw text of your `.prompt` file.
+- **Includes**: Total tokens from all `<include>` and `<include-many>` tags.
+- **Tests**: Tokens consumed by included test files (detected by `/tests/` path or `_test` suffix).
+- **Examples**: Tokens from `examples/` and `context/` directories.
+- **Grounding**: Tokens retrieved via `<web>` tags. (Note: For static architecture audits, this only reflects `<web>` content; dynamic cloud grounding blocks used during generation are excluded from these static scores).
+
+Use this breakdown to surgically prune context. For example, if **Includes** are the primary driver, consider using `select="interface"` mode for some dependencies to include only signatures rather than full implementation.
 
 ```mermaid
 flowchart LR

@@ -90,9 +90,9 @@ usage:
     - name: Minimal (architecture only)
       command: pdd generate --template generic/generate_prompt -e MODULE=orders -e LANG_OR_FRAMEWORK=Python -e ARCHITECTURE_FILE=architecture.json --output 'prompts/${MODULE}_${LANG_OR_FRAMEWORK}.prompt'
     - name: With project docs
-      command: pdd generate --template generic/generate_prompt -e MODULE=orders -e LANG_OR_FRAMEWORK=Python -e ARCHITECTURE_FILE=architecture.json -e PRD_FILE=docs/PRD.md -e API_DOC_FILE=docs/api-documentation.md -e DB_SCHEMA_FILE=context/database-schema.md --output 'prompts/${MODULE}_${LANG_OR_FRAMEWORK}.prompt'
+      command: pdd generate --template generic/generate_prompt -e MODULE=orders -e LANG_OR_FRAMEWORK=Python -e ARCHITECTURE_FILE=architecture.json -e PRD_FILE=docs/PRD.md -e API_DOC_FILE=docs/api.md -e DB_SCHEMA_FILE=context/database-schema.md --output 'prompts/${MODULE}_${LANG_OR_FRAMEWORK}.prompt'
     - name: With CSVs and references (backend/Python)
-      command: pdd generate --template generic/generate_prompt -e MODULE=orders -e LANG_OR_FRAMEWORK=Python -e ARCHITECTURE_FILE=architecture.json -e PRD_FILE=docs/PRD.md -e API_DOC_FILE=docs/api-documentation.md -e DB_SCHEMA_FILE=context/database-schema.md -e BACKEND_FILES_CSV=prompts/backend/python_architecture.csv -e IO_DEPENDENCIES_CSV=prompts/backend/io_dependencies.csv -e CODE_GENERATOR_PROMPT=prompts/code_generator_python.prompt --output 'prompts/${MODULE}_${LANG_OR_FRAMEWORK}.prompt'
+      command: pdd generate --template generic/generate_prompt -e MODULE=orders -e LANG_OR_FRAMEWORK=Python -e ARCHITECTURE_FILE=architecture.json -e PRD_FILE=docs/PRD.md -e API_DOC_FILE=docs/api.md -e DB_SCHEMA_FILE=context/database-schema.md -e BACKEND_FILES_CSV=prompts/backend/python_architecture.csv -e IO_DEPENDENCIES_CSV=prompts/backend/io_dependencies.csv -e CODE_GENERATOR_PROMPT=prompts/code_generator_python.prompt --output 'prompts/${MODULE}_${LANG_OR_FRAMEWORK}.prompt'
     - name: Frontend (TypeScriptReact) variant
       command: pdd generate --template generic/generate_prompt -e MODULE=profile_page -e LANG_OR_FRAMEWORK=TypeScriptReact -e LAYER=frontend -e ARCHITECTURE_FILE=architecture.json -e PRD_FILE=docs/PRD.md --output 'prompts/${MODULE}_${LANG_OR_FRAMEWORK}.prompt'
     - name: From architecture.json
@@ -234,3 +234,4 @@ IMPORTANT: Your reply MUST begin with `<prompt>` on the very first line and end 
   ```
   Replace each `[PLACEHOLDER]` with concrete content while preserving the surrounding structure and literal &lt;include&gt; tags.
   IMPORTANT: When `prompts/_context/data_dictionary.yaml` exists, the Shared Context section with &lt;include&gt; tags for data_dictionary.yaml is MANDATORY. If that file does not exist, omit this section.
+exist, omit this section.

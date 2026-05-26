@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import re
 import json
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -31,107 +32,28 @@ from pdd.architecture_sync import (
     sync_prompts_to_architecture,
     validate_architecture_modules,
 )
+from pdd.server.models import (
+    ArchitectureModule,
+    ContextAuditResponse,
+    GenerateTagsRequest,
+    GenerateTagsResult,
+    RearrangeRequest,
+    RearrangeResult,
+    SyncRequest,
+    SyncResult,
+    ValidateArchitectureRequest,
+    ValidationError,
+    ValidationResult,
+    ValidationWarning,
+)
+from pdd.server.token_counter import get_context_audit as compute_context_audit
 
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/architecture", tags=["architecture"])
 
 _rearrange_executor = ThreadPoolExecutor(max_workers=2)
-
-
-class ArchitectureModule(BaseModel):
-    """Schema for an architecture module."""
-
-    reason: str
-    description: str
-    dependencies: List[str]
-    priority: int
-    filename: str
-    filepath: str
-    tags: List[str] = Field(default_factory=list)
-    interface: Optional[Dict[str, Any]] = None
-    group: Optional[str] = None
-
-
-class ValidationError(BaseModel):
-    """Validation error that blocks saving."""
-
-    type: str  # circular_dependency, missing_dependency, invalid_field
-    message: str
-    modules: List[str]  # Affected module filenames
-
-
-class ValidationWarning(BaseModel):
-    """Validation warning that is informational only."""
-
-    type: str  # duplicate_dependency, orphan_module
-    message: str
-    modules: List[str]
-
-
-class ValidateArchitectureRequest(BaseModel):
-    """Request body for architecture validation."""
-
-    modules: List[ArchitectureModule]
-
-
-class ValidationResult(BaseModel):
-    """Result of architecture validation."""
-
-    valid: bool  # True if no errors (warnings are OK)
-    errors: List[ValidationError]
-    warnings: List[ValidationWarning]
-
-
-class SyncRequest(BaseModel):
-    """Request body for sync-from-prompts operation."""
-
-    filenames: Optional[List[str]] = None  # None = sync all prompts
-    dry_run: bool = False
-
-
-class SyncResult(BaseModel):
-    """Result of sync-from-prompts operation."""
-
-    success: bool
-    updated_count: int
-    skipped_count: int = 0
-    results: List[Dict[str, Any]]
-    validation: ValidationResult
-    errors: List[str] = Field(default_factory=list)
-
-
-class GenerateTagsRequest(BaseModel):
-    """Request body for generate-tags-for-prompt operation."""
-
-    prompt_filename: str  # e.g., "llm_invoke_python.prompt"
-
-
-class GenerateTagsResult(BaseModel):
-    """Result of generate-tags-for-prompt operation."""
-
-    success: bool
-    tags: Optional[str] = None  # Generated XML tags or None if not found
-    has_existing_tags: bool = False  # True if prompt already has PDD tags
-    architecture_entry: Optional[Dict[str, Any]] = None  # The full architecture entry
-    error: Optional[str] = None
-
-
-class RearrangeRequest(BaseModel):
-    """Request body for agentic graph layout rearrangement."""
-
-    architecture_path: str = Field(
-        "architecture.json",
-        description="Path to the architecture file, relative to project root"
-    )
-
-
-class RearrangeResult(BaseModel):
-    """Result of agentic graph rearrangement."""
-
-    success: bool
-    modules: Optional[List[Dict[str, Any]]] = None
-    message: Optional[str] = None
-    error: Optional[str] = None
 
 
 @router.post("/validate", response_model=ValidationResult)
@@ -477,3 +399,36 @@ async def rearrange_graph_layout(request: RearrangeRequest) -> RearrangeResult:
         )
     except Exception as e:
         return RearrangeResult(success=False, error=f"Rearrange failed: {str(e)}")
+
+@router.get("/context-audit", response_model=ContextAuditResponse)
+async def get_context_audit(model: str = "gpt-4o") -> ContextAuditResponse:
+    """
+    Project-wide context window health audit.
+
+    Loads architecture.json and computes token counts and context pressure
+    for every module's prompt file. Results are cached by (content_hash, model).
+    """
+    from pdd.architecture_registry import load_architecture
+    from pdd.path_resolution import get_default_resolver
+
+    project_root = Path.cwd()
+    architecture = load_architecture(project_root / "architecture.json")
+    modules = extract_modules(architecture)
+    
+    resolver = get_default_resolver()
+    prompts_dir = resolver.prompts_dir
+
+    results = {}
+    for module in modules:
+        filename = module["filename"]
+        # Resolve prompt path robustly via prompts_dir
+        prompt_path = prompts_dir / filename
+        
+        try:
+            audit = compute_context_audit(str(prompt_path), model)
+            results[filename] = audit
+        except Exception as e:
+            logger.warning(f"Failed to audit {filename}: {e}")
+            continue
+
+    return ContextAuditResponse(modules=results)

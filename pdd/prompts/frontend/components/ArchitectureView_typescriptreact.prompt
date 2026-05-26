@@ -1,12 +1,25 @@
+<pdd-reason>Architecture workspace container that coordinates loading, graph editing, prompt generation, and context-window health visualization.</pdd-reason>
+<pdd-interface>
+{
+  "type": "frontend",
+  "frontend": {
+    "pages": [
+      {"name": "ArchitectureView", "route": "/architecture"}
+    ]
+  }
+}
+</pdd-interface>
+
 % You are an expert TypeScript + React engineer. Implement `pdd/frontend/components/ArchitectureView.tsx` as the architecture workspace container that coordinates loading, graph editing, prompt generation, and sync workflows.
 
 % Requirements
 1. Export a pure helper `moduleNeedsSync(info?: PromptInfo): boolean` that returns `true` when prompt outputs are incomplete and uses `expected_outputs` when provided (fallback to `['code', 'test', 'example']`).
 2. Define `ArchitectureViewProps` with server status, execution mode (`local`/`remote`), prompt navigation callback, optional batch progress callbacks, optional remote job callback, optional queue/direct sync callbacks, and optional `syncCompletedCounter`.
-3. Manage local UI/data state for: architecture loading/mode, issue URL generation, architecture file loading, existing prompt metadata, prompt generation progress/results, edit mode and validation, sync-from-prompts modal, sync options modal with pending targets, batch filtering, mobile detection, and sidebar collapse.
-4. On mount (and reconnect), if connected: check whether architecture exists, load modules when present, switch to graph mode, and load prompt metadata; if missing or load fails, fall back to empty mode. If disconnected, stop loading gracefully.
+3. Manage local UI/data state for: architecture loading/mode, issue URL generation, architecture file loading, existing prompt metadata, context audit data, prompt generation progress/results, edit mode and validation, sync-from-prompts modal, sync options modal with pending targets, batch filtering, mobile detection, and sidebar collapse.
+4. On mount (and reconnect), if connected: check whether architecture exists, load modules when present, switch to graph mode, load prompt metadata, and load context audit data; if missing or load fails, fall back to empty mode. If disconnected, stop loading gracefully.
 5. Provide `loadExistingPrompts()` that calls `api.listPrompts()`, stores full `promptsInfo`, and tracks filename-only prompt existence in a `Set<string>`.
-6. Support loading architecture JSON from both file browser selection and manual path input with user-facing parse/not-found error messages.
+6. Provide `loadContextAudit(model?: string)` that calls `api.getContextAudit(model || defaultModel)`, and stores `ContextAuditResponse`.
+7. Support loading architecture JSON from both file browser selection and manual path input with user-facing parse/not-found error messages.
 7. In empty mode, provide two entry points:
    - Generate architecture from a GitHub issue URL (validate URL format; support local direct execution and remote command submission).
    - Load an existing architecture file.
@@ -36,7 +49,10 @@
    - Empty architecture onboarding card with generation/load controls.
    - Main graph workspace with collapsible sidebar, toolbar, validation banner, mobile fallback module list, and desktop `DependencyViewer`.
 16. Render and wire all supporting modals: `FileBrowser`, `PromptOrderModal`, `GenerationProgressModal`, `ModuleEditModal`, `AddModuleModal`, `SyncFromPromptModal`, `SyncOptionsModal`.
-17. When `syncCompletedCounter` increases above zero, refresh prompt metadata so sync counts/UI badges update.
+17. When `syncCompletedCounter` increases above zero, refresh prompt metadata and context audit data so sync counts/UI badges and health scores update.
+18. Support a "Context Pressure View" mode in the graph view that highlights modules based on their context window saturation (`context_usage_percent`). In this mode, color-coding is implemented by passing specific status-based colors (Green < 70%, Yellow 70-90%, Red > 90%) to the `ModuleNode` via its `data.colors` prop. The sidebar module list should also be sorted by context pressure (highest first) to help identify optimization targets without disrupting the 2D graph layout.
+19. Add a model selection dropdown to the GraphToolbar to allow users to switch the target LLM for context auditing. When the selected model changes, call `loadContextAudit(newModel)` to refresh the health scores and breakdowns project-wide.
+20. Pass `contextAuditData` through to `DependencyViewer` and `ModuleNode` components.
 
 % Dependencies
 <frontend_api_contract>

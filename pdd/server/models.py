@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -34,6 +34,22 @@ __all__ = [
     "ServerConfig",
     "RemoteSessionInfo",
     "SessionListItem",
+    "TokenBreakdown",
+    "CostEstimate",
+    "TokenMetrics",
+    "ContextAudit",
+    "ContextAuditResponse",
+    "ArchitectureModule",
+    "ValidationError",
+    "ValidationWarning",
+    "ValidateArchitectureRequest",
+    "ValidationResult",
+    "SyncRequest",
+    "SyncResult",
+    "GenerateTagsRequest",
+    "GenerateTagsResult",
+    "RearrangeRequest",
+    "RearrangeResult",
 ]
 
 
@@ -239,3 +255,130 @@ class SessionListItem(BaseModel):
     last_heartbeat: datetime = Field(..., description="Last heartbeat timestamp")
     status: Literal["active", "stale"] = Field(..., description="Session status")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata")
+# ============================================================================
+# Context Audit Models
+# ============================================================================
+
+class TokenBreakdown(BaseModel):
+    """Breakdown of tokens by category."""
+    body: int = Field(0, description="Tokens from the main prompt body")
+    includes: int = Field(0, description="Tokens from included files")
+    tests: int = Field(0, description="Tokens from associated test files")
+    examples: int = Field(0, description="Tokens from associated example files")
+    grounding: int = Field(0, description="Tokens from grounding context")
+
+
+class CostEstimate(BaseModel):
+    """Cost estimation for prompt generation."""
+    input_cost: float = Field(..., description="Estimated cost in currency")
+    model: str = Field(..., description="Model name used for estimation")
+    tokens: int = Field(..., description="Number of tokens")
+    cost_per_million: float = Field(..., description="Cost per million tokens")
+    currency: str = Field("USD", description="Currency code")
+
+
+class TokenMetrics(BaseModel):
+    """Comprehensive token metrics."""
+    token_count: int = Field(..., description="Total number of hydrated tokens")
+    context_limit: Optional[int] = Field(None, description="Model's input context limit")
+    context_usage_percent: Optional[float] = Field(None, description="Percentage of context window used")
+    cost_estimate: Optional[CostEstimate] = Field(None, description="Cost estimation details")
+    breakdown: Optional[TokenBreakdown] = Field(None, description="Detailed token breakdown")
+
+
+class ContextAudit(BaseModel):
+    """Context window audit for a single prompt."""
+    prompt_path: str = Field(..., description="Path to the prompt file")
+    tree_hash: str = Field(..., description="Deterministic hash of the prompt and its dependencies")
+    metrics: TokenMetrics = Field(..., description="Token metrics for the prompt")
+
+
+class ContextAuditResponse(BaseModel):
+    """Response for a project-wide context audit."""
+    modules: Dict[str, ContextAudit] = Field(..., description="Mapping of prompt filename to audit data")
+
+
+# ============================================================================
+# Architecture Models
+# ============================================================================
+
+class ArchitectureModule(BaseModel):
+    """Schema for an architecture module."""
+    reason: str = Field(..., description="The architectural reason for this module")
+    description: str = Field(..., description="Brief description of the module's purpose")
+    dependencies: List[str] = Field(..., description="List of prompt filenames this module depends on")
+    priority: int = Field(..., description="Processing priority for sync operations")
+    filename: str = Field(..., description="The prompt filename (e.g., 'llm_invoke_python.prompt')")
+    filepath: str = Field(..., description="The path to the generated code file")
+    tags: List[str] = Field(default_factory=list, description="Categorization tags")
+    interface: Optional[Dict[str, Any]] = Field(None, description="The <pdd-interface> definition")
+    group: Optional[str] = Field(None, description="Logical grouping for UI layout")
+
+
+class ValidationError(BaseModel):
+    """Validation error that blocks saving."""
+    type: str = Field(..., description="Error type (e.g., circular_dependency)")
+    message: str = Field(..., description="Human-readable error message")
+    modules: List[str] = Field(..., description="Affected module filenames")
+
+
+class ValidationWarning(BaseModel):
+    """Validation warning that is informational only."""
+    type: str = Field(..., description="Warning type (e.g., orphan_module)")
+    message: str = Field(..., description="Human-readable warning message")
+    modules: List[str] = Field(..., description="Affected module filenames")
+
+
+class ValidateArchitectureRequest(BaseModel):
+    """Request body for architecture validation."""
+    modules: List[ArchitectureModule] = Field(..., description="Full list of architecture modules")
+
+
+class ValidationResult(BaseModel):
+    """Result of architecture validation."""
+    valid: bool = Field(..., description="True if no errors (warnings are OK)")
+    errors: List[ValidationError] = Field(..., description="Blocking validation errors")
+    warnings: List[ValidationWarning] = Field(..., description="Informational warnings")
+
+
+class SyncRequest(BaseModel):
+    """Request body for sync-from-prompts operation."""
+    filenames: Optional[List[str]] = Field(None, description="Specific prompts to sync, or null for all")
+    dry_run: bool = Field(False, description="If true, validates changes without writing to disk")
+
+
+class SyncResult(BaseModel):
+    """Result of sync-from-prompts operation."""
+    success: bool = Field(..., description="True if operation completed and validation passed")
+    updated_count: int = Field(..., description="Number of modules successfully updated")
+    skipped_count: int = Field(0, description="Number of modules skipped")
+    results: List[Dict[str, Any]] = Field(..., description="Per-file sync results")
+    validation: ValidationResult = Field(..., description="Validation status of the resulting architecture")
+    errors: List[str] = Field(default_factory=list, description="Operation-level errors")
+
+
+class GenerateTagsRequest(BaseModel):
+    """Request body for generate-tags-for-prompt operation."""
+    prompt_filename: str = Field(..., description="The filename of the prompt (e.g., 'llm_invoke_python.prompt')")
+
+
+class GenerateTagsResult(BaseModel):
+    """Result of generate-tags-for-prompt operation."""
+    success: bool = Field(..., description="Whether generation succeeded")
+    tags: Optional[str] = Field(None, description="The generated XML tag block")
+    has_existing_tags: bool = Field(False, description="True if the prompt already had PDD tags")
+    architecture_entry: Optional[Dict[str, Any]] = Field(None, description="The full architecture entry")
+    error: Optional[str] = Field(None, description="Error message if failed")
+
+
+class RearrangeRequest(BaseModel):
+    """Request body for agentic graph layout rearrangement."""
+    architecture_path: str = Field("architecture.json", description="Path relative to project root")
+
+
+class RearrangeResult(BaseModel):
+    """Result of agentic graph rearrangement."""
+    success: bool = Field(..., description="Whether rearrangement succeeded")
+    modules: Optional[List[Dict[str, Any]]] = Field(None, description="The updated modules list with new positions")
+    message: Optional[str] = Field(None, description="Agent's summary of changes")
+    error: Optional[str] = Field(None, description="Error message if failed")
