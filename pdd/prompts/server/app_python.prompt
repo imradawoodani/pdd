@@ -52,10 +52,17 @@
      - /docs and /redoc for OpenAPI documentation
 
   7. **Frontend serving** (optional):
-     - If pdd/frontend/dist exists, serve static files
-     - Mount /assets for JS/CSS bundles
-     - SPA fallback: serve index.html for non-API routes
-     - Skip API, docs, and WebSocket paths
+     - Resolve the `frontend/dist` directory using this priority:
+       1. Local workspace: `project_root / "pdd" / "frontend" / "dist"`
+       2. Local workspace: `project_root / "frontend" / "dist"`
+       3. Package installation: `Path(__file__).parent.parent / "frontend" / "dist"`
+     - If found:
+       - Log the resolved path and whether it was loaded from the workspace or package.
+       - Serve static files from the resolved directory.
+       - Mount /assets for JS/CSS bundles.
+       - SPA fallback: serve `index.html` for non-API routes.
+     - If not found, log a warning with the attempted package-relative path.
+     - Skip API, docs, and WebSocket paths.
 
   8. **run_server() function**:
      - Parameters: project_root, host, port, log_level, allowed_origins, app, config
