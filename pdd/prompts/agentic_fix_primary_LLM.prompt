@@ -11,7 +11,7 @@ The TEST FILE verifies the code behaves according to the specification.
 - Project root: Current working directory
 
 ## Test Protection Mode: {protect_tests}
-If "true", do NOT modify the test file - only fix the code.
+If "true", you MUST NOT modify any file under `tests/` or the test file itself - only fix the code. If your analysis suggests the test file itself is wrong, stop and report this in your final message — do not edit the test.
 
 ## Original Specification
 <prompt_content>
