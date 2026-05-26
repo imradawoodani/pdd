@@ -260,11 +260,30 @@ def create_app(
     create_websocket_routes(app, _app_state.connection_manager, _app_state.job_manager)
 
     # 4. Serve Frontend Static Files
-    # Look for frontend dist in the pdd package directory
-    frontend_dist = Path(__file__).parent.parent / "frontend" / "dist"
-    if frontend_dist.exists():
-        console.print(f"[green]Serving frontend from:[/green] {frontend_dist}")
+    # Look for frontend dist in both current working directory (local repo) and package directory
+    # We prefer the local version if we are in a development workspace
+    local_candidates = [
+        Path.cwd() / "pdd" / "frontend" / "dist",
+        Path.cwd() / "frontend" / "dist",
+        Path.cwd() / "dist",
+    ]
+    package_frontend_dist = Path(__file__).parent.parent / "frontend" / "dist"
 
+    frontend_dist = None
+    
+    # Check local candidates first to respect local workspace over global package
+    for candidate in local_candidates:
+        if candidate.exists():
+            frontend_dist = candidate
+            console.print(f"[green]Serving frontend from local workspace:[/green] {frontend_dist}")
+            break
+
+    # Fall back to package directory if no local version found
+    if not frontend_dist and package_frontend_dist.exists():
+        frontend_dist = package_frontend_dist
+        console.print(f"[green]Serving frontend from package directory:[/green] {frontend_dist}")
+
+    if frontend_dist:
         # Serve static assets (JS, CSS, etc.)
         app.mount("/assets", StaticFiles(directory=frontend_dist / "assets"), name="assets")
 
