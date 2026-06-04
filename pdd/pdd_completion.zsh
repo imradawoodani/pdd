@@ -456,6 +456,7 @@ _pdd_checkup() {
     '--strict[Strict checks]' \
     '--no-fix[Do not apply fixes]' \
     '--timeout-adder[Add seconds to step timeouts]:seconds:' \
+    '--start-step[Recovery override for legacy checkup step]:step:(1 2 3 4 5 6.1 6.2 6.3 7 8)' \
     '--no-github-state[Skip GitHub state checks]' \
     '--pr[Target PR number or URL]:pr:' \
     '--issue[Target issue number or URL]:issue:' \
@@ -465,6 +466,7 @@ _pdd_checkup() {
     '--reviewer[Primary reviewer role]:reviewer:' \
     '--fixer[Fixer role]:fixer:' \
     '--reviewer-fallback[Fallback reviewer when primary fails]:reviewer:' \
+    '--fixer-fallback[Fallback fixer when primary fixer fails (e.g. credential-limit)]:fixer:' \
     '--max-review-rounds[Max review rounds]:rounds:' \
     '--max-review-cost[Max review cost (USD)]:cost:' \
     '--max-review-minutes[Max review wall-clock minutes]:minutes:' \

@@ -1,49 +1,179 @@
-## v0.0.236 (2026-05-12)
+> Historical record up to v0.0.241. See [GitHub Releases](https://github.com/promptdriven/pdd/releases) for current release notes.
+
+## Unreleased
+
+### Feat
+
+- **sync**: add public-surface and test-churn gates to `pdd sync` to stop silent over-regeneration of mature modules and tests; gates honor anchored `BREAKING-CHANGE:` opt-outs and route failures through the existing `PDD_REPAIR_DIRECTIVE` retry plumbing across the in-process generate, per-op orchestration (`crash`/`verify`/`fix`), `cmd_test_main`, and one-session agentic paths. Configurable via `PDD_TEST_CHURN_THRESHOLD` (default `0.40`, trailing `%` accepted), `PDD_SKIP_PUBLIC_SURFACE_GATE`, `PDD_SKIP_TEST_CHURN_GATE`, `PDD_ALLOW_EMPTY_GENERATION` (escape hatch for the empty-output safety guard that refuses to truncate non-empty existing files with empty LLM responses), or the umbrella `PDD_SKIP_CONFORMANCE` (#1015, closes #1012, #1030).
 
 ### Fix
 
-- **ci**: relax timeouts for two real-LLM cases that flaked in the post-PR-962 release gate (#982)
-- **ci**: entrypoint preflight — replace broken heredoc with python -c (all 77 Cloud Batch tasks were failing exit 2) (#981)
-- **ci**: drop :latest from AR_IMAGE so cloudbuild.yaml's :$BUILD_ID tag doesn't double up (#980)
-- **ci_drift_heal**: revert prompt/arch changes per Greg's P1 review
-- **ci_detect**: collapse prompt to bare path and add example to satisfy auto-heal skip
-- **ci_detect**: exclude path-qualified basename for self prompt
-- **ci_detect,arch**: address PR #930 review — newline include-many, prompt drift, ci_drift_heal arch deps
-- **tests**: align test_ci_drift_heal with main impl after merge
-- **ci**: skip untouched clean-ci auto-deps drift
-- **ci**: scope reverse dependency detection to changed include defs
-- **ci_drift_heal**: code-only phantom crash → update drift, not example
-- **ci_drift_heal**: fail closed on phantom crash with unknown touch state
-- **ci_drift_heal**: pin git-lookup failure semantics + PR/push example shape
-- **ci_drift_heal,docs**: return None on git failure + require --diff-base in CI
-- **ci_drift_heal**: scope phantom-crash filter to actually-untouched modules
-- **prompts,docs**: pin phantom-crash detect filter, caveat sync-arch validation
-- **prompts**: drop steer_timeout from global-sync forward list, add init metadata
-- **architecture**: drop unmatched deps on commands/__init__ entry
-- **architecture**: backfill commands/__init__ entry
-- **ci_drift_heal**: filter phantom run-report crash at detection
-- **ci_drift_heal**: skip phantom crash drift from missing run_report on clean CI
-- **prompts**: pin sync option types/tri-state + match __init__ order
-- **prompts**: complete maintenance drift backfill
-- **prompts**: backfill commands/maintenance and commands/__init__ drift
-- classify Anthropic billing errors as permanent
-- refuse device-flow auth in CI
-- parse codex finding priority prefix
-- **checkup**: address PR #932 Greg review — dedupe completions, portable adapter test
-- **checkup**: address PR #932 review — contract drift, fingerprints, example
-- **checkup**: align contract example with live ReviewLoopConfig (#922)
-- **checkup**: preserve diagnostics across parse-repair + lock positional order (#922)
-- **checkup**: scrub github_pat_ + discover cloud adapter portably (#922)
-- **checkup**: scrub provider envvar dumps and bare AIza/xai/gsk tokens (#922)
-- **checkup**: example sys.path, zsh/fish completion artifacts, signature ordering (#922)
-- **checkup**: defang every pipe-prefixed diagnostics line (#922)
-- **checkup**: defang pipe-table findings + fallback mode docs (#922)
-- **checkup**: expand diagnostics defang to every adapter trip-wire (#922)
-- **checkup**: address PR #932 review — scrubber, prompt drift, examples (#922)
-- **checkup**: defang line-leading 'Error:' to keep cloud adapter from downgrading verdict (#922 round 4)
-- **checkup**: defang severity tags + budget guard + verifier docstring + final-state diagnostics (#922 round 3)
-- **checkup**: keep verdict adapter from short-circuiting on fallback success (#922 follow-up)
-- **checkup**: surface reviewer diagnostics and add opt-in fallback reviewer (#922)
+- **checkup-gates**: close three additional runner-level vectors in the iter-39 deterministic-gate layer for `pdd checkup --pr --review-loop` (#1095, iter-40), each repro-confirmed. (1) Sanitize `PATH` in the gate subprocess env (drop empty entries, `.`, relative entries, and any entry that resolves inside the worktree) AND resolve every tool binary (`mypy` / `ruff` / `black` / `npm` / `pnpm` / `yarn` / `bun` / `npx`) to an absolute path via `shutil.which(tool, path=<sanitized PATH>)` at discovery time. Stores the absolute path in `Gate.cmd` so `subprocess.run` cannot re-consult `PATH` for the top-level binary either; the env-side `PATH` sanitization remains as defence in depth for nested tool spawns by node/npm (e.g. `npm run` → shell → `prettier`). An operator with `PATH=.:$PATH` (or any worktree-resolving entry) could otherwise let a PR-shipped `./mypy` / `./npm` / `./npx` shim become the gate binary. (2) Skip all npm-family gates when the PR diff modifies `package.json` (root or any nested `*/package.json`). Corepack (default in Node 16+) reads the top-level `packageManager` field and fetches+execs the PR-selected version on first invocation — a PR-supplied `"packageManager": "pnpm@10.12.4+sha512.SOMEPRCONTROLLEDHASH"` turns the local gate into a registry download+exec of PR-chosen code. (3) Drop `exc_info=True` from the five DEBUG-level log calls in `pdd/checkup_review_loop.py` (two on the gate discover/run-gates crash paths, three on the optional list-drift-detection fallback paths). `traceback.format_exception` re-renders the raw exception text at DEBUG, bypassing the WARNING-line scrub above and leaking any token/path that surfaced in the exception message into DEBUG-captured log streams.
+- **checkup-gates**: close three additional runner-level vectors in the iter-38 deterministic-gate layer for `pdd checkup --pr --review-loop` (#1095, iter-39), each repro-confirmed. (1) Inject `COREPACK_ENABLE_AUTO_PIN=0` into the gate subprocess env so Corepack-managed yarn/pnpm cannot mutate `package.json` by auto-pinning a `packageManager` field on first run (Corepack 0.31 default behaviour; verified against `pnpm@latest`). (2) Extend the iter-38 mypy "pure package" plugin worktree-resolution probe to the `src/` layout — `worktree/src/<top_level>/` (with `__init__.py`, as a namespace dir, or as `<top_level>.py`) also disables the gate, because editable installs of src-layout projects add `src/` to `sys.path`. (3) Strip the npm/Node config + import-path family from the gate subprocess env: every `NPM_CONFIG_*` / `npm_config_*` key (npm reads both case forms as independent overrides), `NODE_OPTIONS`, and `NODE_PATH`. Confirmed against npm 10.x: `NPM_CONFIG_SCRIPT_SHELL=./evil-sh npm run format:check` executes `./evil-sh -c "prettier --check ."` even when `.npmrc` is safe; `NODE_OPTIONS=--require=./evil.js` injects arbitrary JS into the `npx --no-install tsc` gate.
+- **checkup-gates**: close three runner-level RCE vectors in the iter-37 deterministic-gate layer for `pdd checkup --pr --review-loop` (#1095, iter-38). (1) Skip the entire npm-family gate path — script gates AND the direct `npx --no-install tsc --noEmit` gate — when a package-manager config in the worktree can redirect script execution to a PR-controlled binary: `.npmrc`/`.pnpmrc` with `script-shell`, `.yarnrc` with `script-shell` or `yarn-path`, `.yarnrc.yml` with `yarnPath`, the presence of `.yarn/releases/`, or a PR diff touching any of `.npmrc`/`.pnpmrc`/`.yarnrc`/`.yarnrc.yml`/`.yarn/**`. Confirmed against npm/pnpm/yarn 1 and npx 10.x (all honour `script-shell`). (2) Extend the tsc emit-signal walk from the worktree-root `tsconfig.json` to every custom `-p <path>` / `--project <path>` target referenced by a recognised tsc-flavoured script so an `incremental:true`/`composite:true` setting on a non-root project file (or its extends chain) still triggers the script-gate skip. (3) Strip the Python import-path family (`PYTHONPATH`/`PYTHONHOME`/`PYTHONSTARTUP`/`PYTHONUSERBASE`/`PYTHONNOUSERSITE`) from the gate subprocess env, and disable the mypy gate when ANY "pure package" plugin entry's top-level name maps to a worktree package directory or single-file module — under an editable install or a worktree-resolving `PYTHONPATH=.` the plugin import would otherwise execute PR-controlled worktree code.
+- **checkup**: enforce a SHA-backed verification trust boundary in `pdd checkup --pr --review-loop` so unverified fixer attempts are never rendered as completed fixes. `FixResult` now carries `fixer_result`/`push_status`/`local_fixer_commit_sha`/`pushed_head_sha`, `ReviewLoopState` carries `verified_head_sha`/`remote_pr_head_sha`/`verification_status_by_round`, and the final report renders fixed-field `### Fixes Attempted` bullets plus header `verified-head-sha:` / `remote-pr-head-sha:` lines. Before promoting `fresh-final-review: clean` or `verification=verified`, the loop re-fetches the remote PR head and downgrades to `verification=unverified` on mismatch or budget exhaustion (#1088).
+
+## v0.0.241 (2026-05-17)
+
+### Fix
+
+- **ci_drift_heal**: symlink filter must run before git check-ignore (#1050)
+- **ci_drift_heal**: skip symlink-traversal paths in git add (#1048)
+
+## v0.0.240 (2026-05-16)
+
+### Fix
+
+- **auto-deps**: finalize metadata for every successful output by saving fingerprints and include-dependency hashes, clearing stale run reports, warning on sanitized includes and architecture merge failures, and using `filelock` for CSV cache locking (#989).
+- **sync**: let sync own canonical auto-deps metadata after moving temp outputs, clear canonical run reports, and include attributed `<include ...>` directives in dependency hashes.
+- **orchestrator**: fix post-Step-9 resume routing by honoring cached Step 9 retry output, falling through to cleanup/CI after verified success, respecting `MAX_CYCLES_REACHED`, and re-verifying cached success before resume completion (#1001).
+- **orchestrator**: persist `VERIFICATION_FAILED_ON_RESUME` before cycle advance, filter `.gh-wrapper/` executor artifacts from fix commits, and make post-resume commit/push handling idempotent (#1001).
+
+### CI
+
+- **cloud-batch**: pre-create task result files and install early traps so SPOT preemptions, setup failures, timeouts, and terminations produce explicit JSON outcomes; ignore provisional `preempted` results while streaming (#1045).
+- **cloud-batch**: clean up `gcloud`-leaked multiprocessing workers after submit and increase SPOT `maxRetryCount` from 2 to 3 (#1043, #1044).
+
+### Build
+
+- Bump package metadata, README/PyPI version references, and shell completions from 0.0.239 to 0.0.240; add `filelock>=3.12`.
+
+### Docs
+
+- Align README, prompt, and `architecture.json` contracts for auto-deps finalization, attributed includes, Step 9 resume behavior, `push_with_retry`, and orchestrator signature metadata.
+
+### Test
+
+- Add regression coverage for auto-deps metadata finalization, attributed includes, Step 9 resume/reverification/max-cycle routing, `.gh-wrapper` filtering, idempotent commit/push behavior, and prompt/architecture interface drift.
+
+## v0.0.239 (2026-05-15)
+
+### Feat
+
+- **checkup**: add `--fixer-fallback` for review-loop runs so a secondary fixer can take over once when the primary fixer fails, with alias-aware role checks, pre-fallback worktree reset, audit-trail preservation, and active-fixer promotion for later rounds.
+- **sync**: reduce no-argument global sync dry-run noise by replacing per-module non-Tier-1 warnings with a bucketed `Out of Tier 1 scope` roll-up, while keeping detailed entries under `--verbose` and rendering zero stale modules as a green success signal (#1016).
+
+### Fix
+
+- **agentic**: classify Claude Code subscription weekly-limit messages as permanent `credential-limit` failures so provider waterfalls can rotate credentials instead of burning rate-limit retries.
+- **checkup**: raise the default review-loop cost cap from $10 to $50, skip parse-repair once budget/time is exhausted, preserve the originally configured reviewer across fallback rotations, exclude active reviewer/fixer roles from cross-fallback promotion, and defang failed-fixer summaries before final report rendering.
+- **ci-heal**: replace blanket `git add -A` auto-heal staging with scoped tracked/per-module staging so unrelated `.pdd/meta` artifacts cannot leak into heal commits; stage generated files, new `project_dependencies.csv`, and required fingerprints while skipping gitignored run reports (#1021).
+- **checkup**: apply the same scoped staging discipline to review-loop fix commits so untracked metadata artifacts from other modules are not pushed with PR fixes (#1021).
+- **metadata-sync**: keep architecture and run-report stages gated after earlier hard failures so tracked metadata changes are not picked up by scoped staging during failed finalization.
+
+### Build
+
+- Bump package metadata, README/PyPI version references, and shell completions from 0.0.238 to 0.0.239; add `--fixer-fallback` to shell completions.
+
+### Docs
+
+- Align README, prompt, architecture, context example, and metadata contracts for fixer fallback semantics, credential-limit classification, scoped auto-heal staging, and compact global-sync dry-run output.
+
+### Chore
+
+- Refresh Cloud Batch test-duration data, project dependency CSV entries, and `.pdd/meta` provenance for the updated modules.
+
+### Test
+
+- Add regression coverage for credential-limit classification, fixer fallback success/failure/role guards, budget gates, compact global-sync dry-run output, and #1021 scoped staging cases.
+
+## v0.0.238 (2026-05-14)
+
+### Feat
+
+- **ci auto-heal**: require successful metadata finalization before CI/preflight drift heals are treated as complete, routing healed updates through the shared metadata-sync orchestrator and blocking checkpoint commits when prompt tags, architecture, run reports, or fingerprints fail to finalize (#1006).
+
+### CI
+
+- **auto-heal**: allow trusted internal PRs authored by `prompt-driven-github[bot]` to dispatch the privileged Cloud Build heal path without failing collaborator authorization, while keeping fork PRs and `/heal` comments gated.
+- **cloud-batch**: include `.github/` in source uploads so Batch runs can exercise workflow tests.
+
+### Fix
+
+- **update**: finalize fingerprints after successful default single-file/regeneration updates, clear stale run reports, and skip fingerprint/orchestrator writes when `--output` redirects away from the canonical prompt (#1007).
+- **metadata_sync**: preserve the previous user-facing workflow command (`verify`/`test`/`fix`/`update`) when refreshing fingerprints so synced workflows remain recognized as complete.
+- **ci_drift_heal**: hard-fail metadata finalization errors, snapshot and restore per-module metadata on failed heals, verify finalized fingerprints are staged before commit, and avoid committing PR/push partial-failure state.
+- **ci_drift_heal**: restore compact drift/final summaries, preserve non-example operations, detect requested code-only modules without prompts, and fail closed when a post-update prompt path cannot be resolved.
+- **sync**: fix no-argument global sync for nested architectures by preserving scoped module keys, resolving same-architecture dependencies first, warning on unresolved or ambiguous cross-architecture edges, and running child syncs from the correct cwd with the plain basename target.
+- **sync**: treat `--skip-tests --skip-verify` workflows as complete once required files exist, and ignore `--dry-run` invocations in the duplicate expensive-run guard.
+
+### Build
+
+- Bump package metadata, README/PyPI version references, and shell completions from 0.0.237 to 0.0.238.
+- Tighten `.pdd/meta` ignore rules while retaining the required run reports for long-running metadata/auto-heal modules.
+
+### Chore
+
+- Refresh Cloud Batch test-duration data and synchronize prompt, example, architecture, and `.pdd/meta` artifacts for the updated modules.
+
+### Test
+
+- Add regression coverage for generated-PR auto-heal authorization, metadata finalization/staging failures, default update fingerprinting, redirected-output skips, scoped global sync dependency handling, duplicate dry-run guard behavior, and skipped workflow completion.
+
+## v0.0.237 (2026-05-13)
+
+### CI
+
+- **release**: split releases into `make bump` on feature branches and `make release` tag pushes from `main`, add detached-HEAD/local/remote tag validation, and publish real PyPI artifacts from tag-push GitHub Actions OIDC while retaining manual TestPyPI publishing.
+- **cloud-batch**: restrict real-LLM pytest model selection to Google Vertex Gemini rows so CI does not select slow or unreliable Opus rows (#984).
+
+### Fix
+
+- **bug #964**: move visible step comments into the bug orchestrator. Step prompts now emit `<step_report>` blocks, the orchestrator posts sanitized/truncated GitHub comments with trusted credentials, backfills missed comments on resume, posts fallback comments for failed steps, and persists Step 11 E2E skips without duplicate visible comments.
+- **agentic**: pass Codex/OpenAI provider prompts through stdin with `codex exec --json -`, so Codex receives the prompt body instead of the prompt file path.
+- **agentic-change**: preserve `.pddrc` context loading in minimal runtime/test environments when language extension lookup is unavailable.
+- **checkup**: avoid force-pushing over advanced PR heads; fetch the exact PR branch, rebase the fixer commit, retry a normal push, and abort before verification if fetch/rebase fails.
+- **checkup**: harden review-loop automation by committing/pushing completed fixer changes before stopping on post-fix budget caps, broadening reviewer sweeps, and parsing Codex `Finding:` / `Findings:` priority blocks cleanly.
+- **update**: handle PRD-sync agent tuple output, aggregate PRD-sync cost, and report agent failures without modifying the PRD.
+- **tests**: re-import `pdd.core.*` modules after `sys.modules` cleanup so parent-package attributes stay in sync with reloaded modules.
+
+### Docs
+
+- Add the specification-drift whitepaper with a publication-safe evidence bundle and link it from the README.
+- Update README bug-workflow documentation for the current 12-step flow, including API research, prompt classification, orchestrator-owned comments, and deterministic E2E skip behavior.
+
+### Build
+
+- Bump package metadata, README/PyPI version references, and shell completions from 0.0.236 to 0.0.237.
+- Remove the vestigial `pdd/setup.py` module and its generated prompt/example/metadata artifacts now that `pyproject.toml` is the packaging source of truth.
+
+### Test
+
+- Add regression coverage for orchestrator-owned bug step comments, secret redaction/truncation, resume/backfill idempotency, E2E skip state, checkup PR-head rebase recovery, Codex finding parsing, PRD-sync tuple handling, Codex stdin prompts, and import-cleanup behavior.
+- Ignore generated `*_fixed.py` artifacts during pytest collection.
+
+## v0.0.236 (2026-05-12)
+
+### CI
+
+- **cloud-batch**: harden the image contract with plugin and pytest-config preflights, build images under `$BUILD_ID` before retagging `:latest`, remove the double-`:latest` tag path, and fix the entrypoint parser preflight that was causing all 77 Batch tasks to exit early.
+- **cloud-batch**: record GNU `timeout` exit 124 as a failed result instead of leaving a result gap, stop retrying timeout-killed tasks, lower Batch retries, extend sync-regression command headroom, and relax two flaky real-LLM timeout ceilings.
+- **release**: add a manual GitHub Actions workflow that builds, checks, and publishes artifacts to TestPyPI with trusted publishing.
+
+### Fix
+
+- **checkup**: add the opt-in `--fallback-reviewer-on-failure` path, preserve failed-reviewer diagnostics in final artifacts, and let a clean fallback reviewer supersede a primary-reviewer outage without losing the original failure context.
+- **checkup**: scrub reviewer diagnostic tails for provider secrets and defang adapter-sensitive text (`[SEV]`, line-leading `Error:`, status markers, budget markers, pipe-table rows, and related headings) so logs cannot leak credentials or become synthetic findings in the cloud verdict adapter.
+- **checkup**: parse Codex priority findings such as `[P1]` / `[P2]` from numbered and bold Markdown forms without duplicating trailing checks or verification text; keep all valid findings actionable while using blocking severities only as priority guidance.
+- **agentic**: classify Anthropic billing and credit-exhaustion errors as permanent, preserve `api_error_status` from Claude Code error envelopes, and print a safe provider-skip classification instead of retrying unrecoverable provider failures.
+- **auth**: refuse interactive GitHub device-flow auth in CI and other explicit noninteractive contexts after JWT cache and keyring refresh checks, while still honoring `PDD_JWT_TOKEN` and stored refresh tokens.
+- **llm**: wrap LiteLLM token counting and context-limit probes with a timeout and tiktoken fallback so provider-detection or device-code OAuth hangs cannot wedge LLM invocation.
+- **ci_detect**: make auto-heal module detection selector-aware, support newline-delimited `<include-many>` entries, scan both `prompts/` and `pdd/prompts/`, ignore prose that mentions include tags, and exclude the detector/helper modules from headless auto-heal.
+- **ci_drift_heal**: tighten diff-base and phantom-crash handling so untouched clean modules are skipped, code-only crashes update drift instead of examples, and failed sync/example regeneration rolls back only the affected module metadata.
+- **prompts/architecture**: backfill command registration and maintenance prompt drift, restore the `commands/__init__` architecture entry, align `sync` option metadata, and keep prompt/example/completion metadata in sync.
+
+### Build
+
+- Bump package metadata, README/PyPI version references, and shell completions from 0.0.235 to 0.0.236.
+- Add `pytest-timeout`, default pytest timeouts, strict marker/config validation, and the missing marker registrations used by the public test suite.
+
+### Docs
+
+- Document `sync-architecture`, update CI auto-heal docs to match the GitHub Actions dispatcher plus Cloud Build ownership model, and clarify metadata-sync rollback behavior.
+
+### Test
+
+- Add and expand regression coverage for checkup fallback/report parsing/secret scrubbing, noninteractive auth, Anthropic billing classification, selector-aware CI detection, token-counter timeouts, pytest marker isolation, and Cloud Batch timeout behavior.
 
 ## v0.0.235 (2026-05-12)
 

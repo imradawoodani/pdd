@@ -535,12 +535,15 @@ def test_run_agentic_task_codex_success(mock_cwd, mock_env, mock_load_model_data
     assert abs(cost - 7.50) < 0.0001
 
     # Verify command - now uses full path from _find_cli_binary
-    args, _ = mock_subprocess.call_args
+    args, kwargs = mock_subprocess.call_args
     cmd = args[0]
     assert cmd[0] == "/bin/codex"  # Uses discovered path, not hardcoded name
     assert "--sandbox" in cmd
     assert "danger-full-access" in cmd
     assert "--json" in cmd
+    assert cmd[-1] == "-"
+    assert kwargs["input"] is not None
+    assert "instruction" in kwargs["input"]
 
 def test_run_agentic_task_fallback(mock_shutil_which, mock_subprocess_run, mock_env, mock_load_model_data, tmp_path):
     """Test fallback from Anthropic (failure) to Google (success)."""
@@ -2973,6 +2976,11 @@ class TestFindStateCommentPagination:
                 f"Without it, GitHub API only returns first 30 comments. "
                 f"Command was: {args}"
             )
+            assert "--slurp" in args, (
+                f"gh api command missing --slurp flag. "
+                f"Without it, paginated REST pages may be emitted as multiple JSON documents. "
+                f"Command was: {args}"
+            )
 
     # ---- Test 2: Behavioral — state comment beyond 30 is found ----
 
@@ -3000,10 +3008,34 @@ class TestFindStateCommentPagination:
             assert comment_id == 1035  # 1000 + 35
             assert state["last_completed_step"] == 35
 
+    def test_find_state_comment_flattens_slurped_pages(self, tmp_path):
+        """``gh api --paginate --slurp`` wraps REST pages in an outer list."""
+        mock_comments = _make_mock_comments(42, state_positions=[35])
+        pages = [mock_comments[:30], mock_comments[30:]]
+
+        with patch("shutil.which", return_value="/usr/bin/gh"), \
+             patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout=json.dumps(pages),
+            )
+            result = _find_state_comment("owner", "repo", 481, "bug", tmp_path)
+
+            assert result is not None
+            comment_id, state = result
+            assert comment_id == 1035
+            assert state["last_completed_step"] == 35
+
     # ---- Test 3: Returns first matching state comment ----
 
-    def test_find_state_comment_returns_first_match(self, tmp_path):
-        """When multiple state comments exist, returns the first one found."""
+    def test_find_state_comment_returns_highest_id_match(self, tmp_path):
+        """When multiple state comments exist, returns the one with the highest id.
+
+        GitHub assigns monotonically increasing comment ids. Under a duplicate-
+        marker hazard (two workers both POST a state comment, or an old run's
+        comment was never cleared) the highest id corresponds to the most recently
+        written state, which is what a normal resume should load.
+        """
         mock_comments = _make_mock_comments(42, state_positions=[10, 35])
 
         with patch("shutil.which", return_value="/usr/bin/gh"), \
@@ -3016,9 +3048,9 @@ class TestFindStateCommentPagination:
 
             assert result is not None
             comment_id, state = result
-            # Should return the first match (position 10), not the later one
-            assert comment_id == 1010
-            assert state["last_completed_step"] == 10
+            # Should return the highest-id match (position 35 → id 1035), not first
+            assert comment_id == 1035
+            assert state["last_completed_step"] == 35
 
     # ---- Test 4: No state comment exists ----
 
@@ -3580,6 +3612,47 @@ def test_issue557_ndjson_modern_item_completed_parsing(tmp_path):
         f"Expected agent_message text in output, got: {output!r}"
     )
     assert "auth" in output and "payments" in output
+
+
+def test_codex_provider_pipes_prompt_via_stdin(tmp_path):
+    """Codex positional prompt must be '-' so it receives the prompt body."""
+    from pdd.agentic_common import _run_with_provider
+
+    with patch.dict(
+        os.environ,
+        {"OPENAI_API_KEY": "test-key", "CODEX_MODEL": "test-model"},
+        clear=False,
+    ), \
+         patch("pdd.agentic_common._find_cli_binary", return_value="/usr/bin/codex"), \
+         patch("pdd.agentic_common._subprocess_run") as mock_run:
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps({
+                "type": "result",
+                "output": "ok",
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 10,
+                    "cached_input_tokens": 0,
+                },
+            }),
+            stderr="",
+        )
+        prompt_file = tmp_path / ".agentic_prompt_test.txt"
+        prompt_file.write_text("test prompt body")
+
+        success, output, _cost, _model = _run_with_provider(
+            "openai", prompt_file, tmp_path, timeout=60.0, verbose=False, quiet=False
+        )
+
+    assert success is True
+    assert output == "ok"
+    args, kwargs = mock_run.call_args
+    cmd = args[0]
+    assert cmd[cmd.index("--json") + 1] == "-"
+    assert cmd[cmd.index("--model") + 1] == "test-model"
+    assert str(prompt_file) not in cmd
+    assert kwargs["input"] == "test prompt body"
 
 
 def test_issue557_ndjson_multiple_item_completed_picks_agent_message(tmp_path):
@@ -4858,6 +4931,140 @@ class TestIssue1072PermanentErrors:
         assert _is_permanent_error("Rate limit exceeded") is False
         assert _is_permanent_error("Timeout expired") is False
         assert _is_permanent_error("Connection reset by peer") is False
+
+
+class TestCredentialLimitClassification:
+    """Issue (this PR): Claude Code subscription-tier weekly-limit
+    classification.
+
+    The fixer subprocess inside ``pdd checkup --pr`` can return a
+    ``{"api_error_status":429,"result":"You've hit your limit · resets May
+    18, 11pm (UTC)","duration_api_ms":0,"total_cost_usd":0}`` envelope when
+    the user's Claude Code subscription weekly cap fires. ``duration_api_ms:0``
+    + ``total_cost_usd:0`` is the tell that the local CLI rejected before any
+    API call — this is the subscription-tier weekly limit, NOT a transient
+    API 429. The previous ``_is_rate_limited`` short-circuit treated it as
+    transient and burned 3 × 60 s retries; this classification lets the
+    cloud OAuth-token waterfall rotate to a different credential.
+    """
+
+    from pdd.agentic_common import _classify_permanent_error
+
+    EXACT_BUG_ERROR = (
+        'Exit code 1: {"type":"result","subtype":"success","is_error":true,'
+        '"api_error_status":429,"duration_ms":658,"duration_api_ms":0,'
+        '"num_turns":1,"result":"You\'ve hit your limit · resets May 18, '
+        '11pm (UTC)","stop_reason":"stop_sequence","total_cost_usd":0,'
+        '"service_tier":"standard"}'
+    )
+
+    def test_classify_credential_limit_from_claude_subscription_429(self):
+        """The exact JSON envelope from the bug report must classify as
+        ``credential-limit`` — not as the transient rate-limit class. This is
+        the load-bearing assertion: without it, ``run_agentic_task`` retries
+        on the 60s rate-limit floor and the fixer dead-stops the checkup loop.
+        """
+        from pdd.agentic_common import _classify_permanent_error
+
+        assert (
+            _classify_permanent_error(self.EXACT_BUG_ERROR) == "credential-limit"
+        ), (
+            "Subscription weekly-limit error misclassified as transient — "
+            "expected stable token 'credential-limit' so pdd_cloud's OAuth "
+            "waterfall can rotate credentials"
+        )
+
+    def test_credential_limit_is_permanent(self):
+        """``_is_permanent_error`` is the public wrapper used by callers
+        outside the classification module."""
+        assert _is_permanent_error(self.EXACT_BUG_ERROR) is True
+
+    def test_generic_429_still_transient(self):
+        """Regression guard for #1384: a generic API-tier 429 without the
+        "hit your limit · resets" anchor MUST stay transient so
+        ``RATE_LIMIT_BACKOFF_FLOOR`` still applies. Without this, every
+        provider 429 would be marked permanent and a recoverable
+        rate-limit window would be reported as a hard failure.
+        """
+        from pdd.agentic_common import _classify_permanent_error
+
+        assert (
+            _classify_permanent_error(
+                "Error: api_error_status: 429 rate limit exceeded"
+            )
+            is None
+        )
+        assert (
+            _classify_permanent_error('{"api_error_status":429,"result":"Too many requests"}')
+            is None
+        )
+
+    def test_credential_limit_phrase_alone_does_not_false_positive(self):
+        """The pattern MUST require BOTH "hit your limit" AND "reset(s)"
+        anchors. A reviewer/fixer that happens to say "User hit your limit
+        of 10 items" in summary prose (no "resets") must NOT be classified
+        as credential-limit — that would silently kill the retry path for
+        unrelated text.
+        """
+        from pdd.agentic_common import _classify_permanent_error
+
+        assert _classify_permanent_error("User hit your limit of 10 items") != "credential-limit"
+        # And without any other strong/transient signal, it falls all the way
+        # through to None (no false-permanent classification).
+        assert _classify_permanent_error("User hit your limit of 10 items") is None
+
+    def test_credential_limit_does_not_match_prose_with_substrings_apart(self):
+        """Reviewer finding bodies embedded in subprocess stdout can contain
+        BOTH anchors in prose — e.g. a reviewer describing this very bug —
+        with no time-token between them. The pattern must require proximity
+        plus a time-token after ``resets`` so distant-substring prose does
+        NOT classify as ``credential-limit`` (which would short-circuit the
+        rate-limit retry path on benign text).
+        """
+        from pdd.agentic_common import _classify_permanent_error
+
+        assert (
+            _classify_permanent_error(
+                "if you hit your limit, nothing resets automatically"
+            )
+            is None
+        ), (
+            "Loose ``hit your limit.*?resets?`` greedy pattern is matching "
+            "unrelated prose. Tighten the regex to require a time-token after "
+            "``resets`` and cap proximity between the anchors."
+        )
+
+    def test_credential_limit_matches_subscription_envelope_with_full_date(self):
+        """The exact Claude Code envelope with a full date after ``resets``
+        — e.g. ``You've hit your limit · resets May 18, 11pm (UTC)`` — MUST
+        classify as ``credential-limit``. This is the load-bearing case the
+        regex tightening must not regress.
+        """
+        from pdd.agentic_common import _classify_permanent_error
+
+        envelope = (
+            'Exit code 1: {"api_error_status":429,'
+            '"result":"You\'ve hit your limit · resets May 18, '
+            '11pm (UTC)"}'
+        )
+        assert (
+            _classify_permanent_error(envelope) == "credential-limit"
+        )
+
+    def test_credential_limit_matches_subscription_envelope_with_time_only(self):
+        """Same envelope but with only a time-of-day after ``resets`` —
+        the regex must still match when a time token follows the anchor
+        even without a date prefix.
+        """
+        from pdd.agentic_common import _classify_permanent_error
+
+        envelope = (
+            'Exit code 1: {"api_error_status":429,'
+            '"result":"You\'ve hit your limit · resets 11pm (UTC)"}'
+        )
+        assert (
+            _classify_permanent_error(envelope) == "credential-limit"
+        )
 
 
 class TestIssue1072FailureLogging:
@@ -6942,3 +7149,582 @@ class TestIssue814BillingErrorsPermanent:
         )
         # 3. No backoff sleep — permanent errors must NOT delay the fallback
         sleep_mock.assert_not_called()
+
+
+# =========================================================================
+# Issue #1080: porcelain-rename handling in _revert_out_of_scope_changes
+# =========================================================================
+
+
+class TestRevertOutOfScopeChangesRename1080:
+    """Issue #1080: ``_revert_out_of_scope_changes`` must handle staged
+    renames via the structured ``--porcelain=v1 -z`` parser, never
+    constructing a fake ``"old -> new"`` literal path.
+    """
+
+    @staticmethod
+    def _git_env() -> dict:
+        return {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "t@t",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+        }
+
+    def _init_repo(self, repo: Path, files: dict) -> None:
+        repo.mkdir(parents=True, exist_ok=True)
+        env = self._git_env()
+        _subprocess.run(["git", "init", str(repo)], check=True, capture_output=True, env=env)
+        _subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t"],
+                       check=True, capture_output=True, env=env)
+        _subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"],
+                       check=True, capture_output=True, env=env)
+        for rel, content in files.items():
+            tgt = repo / rel
+            tgt.parent.mkdir(parents=True, exist_ok=True)
+            tgt.write_text(content)
+        _subprocess.run(["git", "-C", str(repo), "add", "-A"],
+                       check=True, capture_output=True, env=env)
+        _subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"],
+                       check=True, capture_output=True, env=env)
+
+    def _git(self, repo: Path, *args: str) -> None:
+        _subprocess.run(["git", "-C", str(repo), *args], check=True,
+                       capture_output=True, text=True, env=self._git_env())
+
+    def test_reverts_out_of_scope_staged_rename(self, tmp_path):
+        """An out-of-scope staged rename must be reverted on disk and
+        the returned list must not contain a ``Path("old -> new")``
+        literal produced by the buggy ``line[3:]`` parser."""
+        from pdd.agentic_common import _revert_out_of_scope_changes
+
+        proj = tmp_path / "repo"
+        self._init_repo(proj, {
+            "code.py": "def main(): pass\n",
+            "unrelated.py": "def other(): pass\n",
+        })
+        self._git(proj, "mv", "unrelated.py", "renamed_unrelated.py")
+
+        allowed = {(proj / "code.py").resolve()}
+        reverted = _revert_out_of_scope_changes(proj, allowed)
+
+        assert (proj / "unrelated.py").exists(), (
+            "Out-of-scope rename survived: old-side file not restored"
+        )
+        assert not (proj / "renamed_unrelated.py").exists(), (
+            "Out-of-scope rename survived: new-side file still exists"
+        )
+        for p in reverted:
+            assert " -> " not in str(p), (
+                f"Fake combined path leaked into return value: {p!r}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Trusted step-comment helpers
+#
+# Orchestrators own per-step `## Step N/T:` comments via trusted PDD
+# credentials. Step prompts emit `<step_report>...</step_report>` blocks; the
+# orchestrator extracts them, sanitizes/truncates, and posts via
+# `gh issue comment`. Three public helpers form the contract.
+# ---------------------------------------------------------------------------
+
+
+class TestExtractStepReport:
+    """Public helper: extract_step_report(text) -> Optional[str]."""
+
+    def test_returns_inner_block_trimmed(self):
+        from pdd.agentic_common import extract_step_report
+
+        body = (
+            "preamble\n<step_report>\n## Step 1/8: Discovery\n\n"
+            "Details here.\n</step_report>\nFILES_MODIFIED: x.py"
+        )
+        assert extract_step_report(body) == "## Step 1/8: Discovery\n\nDetails here."
+
+    def test_returns_none_when_block_missing(self):
+        from pdd.agentic_common import extract_step_report
+
+        assert extract_step_report("just some text no markers") is None
+
+    def test_returns_none_on_empty_or_none(self):
+        from pdd.agentic_common import extract_step_report
+
+        assert extract_step_report(None) is None
+        assert extract_step_report("") is None
+
+    def test_returns_last_block_when_multiple(self):
+        from pdd.agentic_common import extract_step_report
+
+        body = (
+            "<step_report>first</step_report>\n"
+            "middle text\n"
+            "<step_report>second body</step_report>"
+        )
+        assert extract_step_report(body) == "second body"
+
+    def test_case_insensitive(self):
+        from pdd.agentic_common import extract_step_report
+
+        body = "<STEP_REPORT>UPPERCASE</STEP_REPORT>"
+        assert extract_step_report(body) == "UPPERCASE"
+
+    def test_multiline_dotall(self):
+        from pdd.agentic_common import extract_step_report
+
+        body = "<step_report>line1\nline2\nline3</step_report>"
+        assert extract_step_report(body) == "line1\nline2\nline3"
+
+
+class TestNormalizeStepCommentsState:
+    """Public helper: normalize_step_comments_state(raw) -> Set[int]."""
+
+    def test_none_returns_empty_set(self):
+        from pdd.agentic_common import normalize_step_comments_state
+
+        result = normalize_step_comments_state(None)
+        assert result == set()
+        assert isinstance(result, set)
+
+    def test_list_of_ints_returns_set(self):
+        from pdd.agentic_common import normalize_step_comments_state
+
+        assert normalize_step_comments_state([1, 2, 3]) == {1, 2, 3}
+
+    def test_tuple_of_ints_returns_set(self):
+        from pdd.agentic_common import normalize_step_comments_state
+
+        assert normalize_step_comments_state((4, 5, 6)) == {4, 5, 6}
+
+    def test_set_returns_set_copy(self):
+        from pdd.agentic_common import normalize_step_comments_state
+
+        src = {1, 2}
+        result = normalize_step_comments_state(src)
+        assert result == {1, 2}
+        result.add(99)
+        assert 99 not in src
+
+    def test_list_of_int_strings_coerces(self):
+        from pdd.agentic_common import normalize_step_comments_state
+
+        assert normalize_step_comments_state(["1", "2", "3"]) == {1, 2, 3}
+
+    def test_legacy_dict_with_posted_flag_returns_set_of_int_keys(self):
+        """The legacy bug-orchestrator persisted step_comments as a dict:
+        ``{"1": {"posted": True}, "2": {"posted": False}}``. Coerce that
+        into the Set[int] shape, treating both ``posted`` and
+        ``failed_posted`` as signals that GitHub received a comment.
+        """
+        from pdd.agentic_common import normalize_step_comments_state
+
+        legacy = {
+            "1": {"posted": True},
+            "2": {"posted": True, "fallback": True},
+            "3": {"posted": False, "fallback_pending": True},
+            "4": {"failed_posted": True, "failed_pending": False},
+        }
+        result = normalize_step_comments_state(legacy)
+        assert result == {1, 2, 4}
+
+    def test_legacy_dict_with_true_value(self):
+        from pdd.agentic_common import normalize_step_comments_state
+
+        assert normalize_step_comments_state({"5": True, "6": False}) == {5}
+
+    def test_malformed_entries_are_skipped(self):
+        from pdd.agentic_common import normalize_step_comments_state
+
+        garbage = ["not-an-int", None, 5, "7", 9.5, True, {"posted": True}]
+        result = normalize_step_comments_state(garbage)
+        assert 5 in result
+        assert 7 in result
+        assert 9 not in result
+        assert "not-an-int" not in result
+        assert all(isinstance(v, int) for v in result)
+
+    def test_empty_collections(self):
+        from pdd.agentic_common import normalize_step_comments_state
+
+        assert normalize_step_comments_state([]) == set()
+        assert normalize_step_comments_state({}) == set()
+        assert normalize_step_comments_state(set()) == set()
+
+    def test_garbage_input_returns_empty_set(self):
+        from pdd.agentic_common import normalize_step_comments_state
+
+        assert normalize_step_comments_state(42) == set()
+        assert normalize_step_comments_state("string") == set()
+
+    def test_frozenset_input(self):
+        from pdd.agentic_common import normalize_step_comments_state
+
+        assert normalize_step_comments_state(frozenset({7, 8})) == {7, 8}
+
+
+class TestPostStepCommentOnce:
+    """Public helper: post_step_comment_once(*, repo_owner, repo_name,
+    issue_number, step_num, body, posted_steps, cwd) -> bool.
+
+    Idempotent: returns True immediately if step_num is already in
+    posted_steps. On success, mutates posted_steps in place.
+    """
+
+    def test_idempotent_skip_when_already_posted(self, tmp_path):
+        from pdd.agentic_common import post_step_comment_once
+
+        posted = {1, 2, 3}
+        with patch("pdd.agentic_common.subprocess.run") as mock_run:
+            result = post_step_comment_once(
+                repo_owner="owner",
+                repo_name="repo",
+                issue_number=42,
+                step_num=2,
+                body="some report body",
+                posted_steps=posted,
+                cwd=tmp_path,
+            )
+            assert result is True
+            assert mock_run.call_count == 0
+        assert posted == {1, 2, 3}
+
+    def test_posts_via_gh_and_mutates_set_on_success(self, tmp_path):
+        from pdd.agentic_common import post_step_comment_once
+
+        posted = {1}
+        with patch("pdd.agentic_common._find_cli_binary", return_value="/usr/bin/gh"), \
+             patch("pdd.agentic_common.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            result = post_step_comment_once(
+                repo_owner="owner",
+                repo_name="repo",
+                issue_number=42,
+                step_num=5,
+                body="## Step 5/8: Test\n\nAll green.",
+                posted_steps=posted,
+                cwd=tmp_path,
+            )
+            assert result is True
+            assert 5 in posted
+            assert mock_run.call_count == 1
+            args, kwargs = mock_run.call_args
+            assert args[0][:4] == ["gh", "issue", "comment", "42"]
+            assert "--repo" in args[0]
+            assert "owner/repo" in args[0]
+            body_index = args[0].index("--body")
+            assert "## Step 5/8: Test" in args[0][body_index + 1]
+
+    def test_returns_false_and_does_not_mutate_on_gh_failure(self, tmp_path):
+        from pdd.agentic_common import post_step_comment_once
+
+        posted = {1}
+        with patch("pdd.agentic_common._find_cli_binary", return_value="/usr/bin/gh"), \
+             patch("pdd.agentic_common.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="rate limited")
+            result = post_step_comment_once(
+                repo_owner="owner",
+                repo_name="repo",
+                issue_number=42,
+                step_num=5,
+                body="body",
+                posted_steps=posted,
+                cwd=tmp_path,
+            )
+            assert result is False
+            assert 5 not in posted
+
+    def test_returns_false_when_gh_missing(self, tmp_path):
+        from pdd.agentic_common import post_step_comment_once
+
+        posted = set()
+        with patch("pdd.agentic_common._find_cli_binary", return_value=None):
+            result = post_step_comment_once(
+                repo_owner="owner",
+                repo_name="repo",
+                issue_number=42,
+                step_num=5,
+                body="body",
+                posted_steps=posted,
+                cwd=tmp_path,
+            )
+            assert result is False
+            assert posted == set()
+
+    def test_redacts_known_secret_formats(self, tmp_path):
+        from pdd.agentic_common import post_step_comment_once
+
+        secret_body = (
+            "GH_TOKEN=ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            "google: AIzaSyA-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            "openai: sk-aaaaaaaaaaaaaaaaaaaaaaaa\n"
+        )
+        with patch("pdd.agentic_common._find_cli_binary", return_value="/usr/bin/gh"), \
+             patch("pdd.agentic_common.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            post_step_comment_once(
+                repo_owner="owner",
+                repo_name="repo",
+                issue_number=1,
+                step_num=1,
+                body=secret_body,
+                posted_steps=set(),
+                cwd=tmp_path,
+            )
+            sent = mock_run.call_args[0][0]
+            body_index = sent.index("--body")
+            posted_body = sent[body_index + 1]
+            assert "ghp_aaaaaaaaaaaaaaaaaaaaaaaa" not in posted_body
+            assert "AIzaSyA-aaaaaaaaaaaaaaaaaaaa" not in posted_body
+            assert "sk-aaaaaaaaaaaaaaaaaaaaaaaa" not in posted_body
+            assert "[REDACTED" in posted_body
+
+    def test_truncates_oversized_body(self, tmp_path):
+        from pdd.agentic_common import post_step_comment_once
+
+        oversized = "A" * 200_000
+        with patch("pdd.agentic_common._find_cli_binary", return_value="/usr/bin/gh"), \
+             patch("pdd.agentic_common.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            post_step_comment_once(
+                repo_owner="owner",
+                repo_name="repo",
+                issue_number=1,
+                step_num=1,
+                body=oversized,
+                posted_steps=set(),
+                cwd=tmp_path,
+            )
+            sent = mock_run.call_args[0][0]
+            body_index = sent.index("--body")
+            posted_body = sent[body_index + 1]
+            assert len(posted_body) < 100_000
+            assert "truncated" in posted_body.lower()
+
+    def test_exception_does_not_raise(self, tmp_path):
+        """Any subprocess exception is logged and surfaced as False."""
+        from pdd.agentic_common import post_step_comment_once
+
+        posted = set()
+        with patch("pdd.agentic_common._find_cli_binary", return_value="/usr/bin/gh"), \
+             patch("pdd.agentic_common.subprocess.run", side_effect=OSError("boom")):
+            result = post_step_comment_once(
+                repo_owner="owner",
+                repo_name="repo",
+                issue_number=1,
+                step_num=1,
+                body="body",
+                posted_steps=posted,
+                cwd=tmp_path,
+            )
+            assert result is False
+            assert posted == set()
+
+
+# ---------------------------------------------------------------------------
+# Duplicate state-marker hazard — issue #1149 round 2
+# ---------------------------------------------------------------------------
+
+from pdd.agentic_common import (
+    _find_all_state_comments,
+    github_clear_state,
+    github_save_state,
+)
+
+
+class TestDuplicateStateCommentHandling:
+    """Verify that the dedupe path closes the race window where two
+    valid state comments coexist (e.g. a concurrent worker re-created
+    one in the gap between a clean-restart pre-clear and our first
+    save). The legacy ``_find_state_comment`` returns only the first
+    match; a future normal resume picking it can silently load stale
+    step outputs from the older marker."""
+
+    def test_find_all_returns_every_matching_marker_id(self, tmp_path):
+        """``_find_all_state_comments`` MUST return every comment id
+        whose body carries the workflow's state marker, not just the
+        first. This is what makes the dedupe sweep / clear-all possible.
+        """
+        mock_comments = _make_mock_comments(8, state_positions=[2, 5, 7])
+
+        with patch("shutil.which", return_value="/usr/bin/gh"), \
+             patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(mock_comments))
+            ids = _find_all_state_comments("owner", "repo", 481, "bug", tmp_path)
+
+        assert ids == [1002, 1005, 1007], (
+            f"Expected every matching id [1002, 1005, 1007]; got {ids!r}"
+        )
+
+    def test_find_all_flattens_slurped_pages(self, tmp_path):
+        """The duplicate-marker sweep must see matches on every slurped page."""
+        mock_comments = _make_mock_comments(8, state_positions=[2, 5, 7])
+        pages = [mock_comments[:4], mock_comments[4:]]
+
+        with patch("shutil.which", return_value="/usr/bin/gh"), \
+             patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(pages))
+            ids = _find_all_state_comments("owner", "repo", 481, "bug", tmp_path)
+
+        assert ids == [1002, 1005, 1007]
+
+    def test_github_clear_state_deletes_all_matching_markers(self, tmp_path):
+        """``github_clear_state`` must DELETE every comment carrying
+        the marker — leaving any one behind reintroduces the silent
+        stale-state hazard."""
+        mock_comments = _make_mock_comments(8, state_positions=[2, 5, 7])
+
+        deletes: list = []
+
+        def side_effect(args, **kwargs):
+            cmd = list(args)
+            m = MagicMock(returncode=0)
+            if cmd[:2] == ["gh", "api"] and "-X" in cmd and cmd[cmd.index("-X") + 1] == "DELETE":
+                deletes.append(cmd[2])  # capture the issues/comments/<id> path
+                return m
+            # The LIST call (no -X DELETE) — return the mock comments
+            m.stdout = json.dumps(mock_comments)
+            return m
+
+        with patch("shutil.which", return_value="/usr/bin/gh"), \
+             patch("subprocess.run", side_effect=side_effect):
+            ok = github_clear_state("owner", "repo", 481, "bug", tmp_path)
+
+        assert ok is True
+        deleted_ids = sorted(
+            int(p.rsplit("/", 1)[-1]) for p in deletes
+        )
+        assert deleted_ids == [1002, 1005, 1007], (
+            f"Expected DELETE for all three marker comments; "
+            f"saw {deleted_ids!r} from {deletes!r}"
+        )
+
+    def test_github_save_state_dedupe_adopts_newest_and_deletes_rest(self, tmp_path):
+        """When ``dedupe=True`` and ``comment_id is None`` and multiple
+        existing state markers are found, ``github_save_state`` must
+        (1) PATCH the highest-id marker in place with the new state and
+        (2) DELETE the older markers — converging to exactly one state
+        comment regardless of prior races."""
+        mock_comments = _make_mock_comments(8, state_positions=[2, 5, 7])
+
+        actions: list = []
+
+        def side_effect(args, **kwargs):
+            cmd = list(args)
+            m = MagicMock(returncode=0, stdout="{}")
+            # LIST call: no -X PATCH/DELETE/POST → return comments
+            if "-X" not in cmd:
+                m.stdout = json.dumps(mock_comments)
+                return m
+            verb = cmd[cmd.index("-X") + 1]
+            # Capture the comment-id from the URL when present
+            target = next((p for p in cmd if "/comments/" in p), None)
+            cid = int(target.rsplit("/", 1)[-1]) if target else None
+            actions.append((verb, cid))
+            if verb == "POST":
+                # POST shouldn't happen in this scenario — flag it loudly
+                m.stdout = json.dumps({"id": 9999})
+            return m
+
+        with patch("shutil.which", return_value="/usr/bin/gh"), \
+             patch("subprocess.run", side_effect=side_effect):
+            returned_id = github_save_state(
+                "owner", "repo", 481, "bug",
+                {"last_completed_step": 7, "step_outputs": {}},
+                tmp_path,
+                comment_id=None,
+                dedupe=True,
+            )
+
+        # Adopted the highest-id existing marker (1007).
+        assert returned_id == 1007, (
+            f"Expected dedupe to adopt the most-recent marker (1007); got {returned_id!r}"
+        )
+        verbs = [v for v, _ in actions]
+        assert "POST" not in verbs, (
+            f"Expected dedupe to adopt-and-PATCH, not POST a new marker; saw verbs={verbs!r}"
+        )
+        patched = [cid for v, cid in actions if v == "PATCH"]
+        deleted = [cid for v, cid in actions if v == "DELETE"]
+        assert patched == [1007], f"PATCH should hit 1007 only; got {patched!r}"
+        assert sorted(deleted) == [1002, 1005], (
+            f"DELETE should hit the two older markers (1002, 1005); got {sorted(deleted)!r}"
+        )
+
+    def test_github_save_state_dedupe_false_skips_find_all(self, tmp_path):
+        """``dedupe=False`` (the default) MUST preserve the original
+        behavior: blind POST with no list-comments side effect. We pay
+        the find-all cost only when the caller opts in."""
+        listed: list = []
+
+        def side_effect(args, **kwargs):
+            cmd = list(args)
+            m = MagicMock(returncode=0, stdout=json.dumps({"id": 5000}))
+            # The LIST call has no -X (it's a GET to /comments)
+            if "-X" not in cmd and "/issues/" in " ".join(cmd) and "/comments" in " ".join(cmd):
+                listed.append(cmd)
+                m.stdout = json.dumps([])
+            return m
+
+        with patch("shutil.which", return_value="/usr/bin/gh"), \
+             patch("subprocess.run", side_effect=side_effect):
+            github_save_state(
+                "owner", "repo", 481, "bug",
+                {"last_completed_step": 1, "step_outputs": {}},
+                tmp_path,
+                comment_id=None,
+                dedupe=False,
+            )
+
+        assert listed == [], (
+            f"dedupe=False should NOT list comments; saw {len(listed)} list calls"
+        )
+
+    def test_github_save_state_dedupe_logs_warning_on_delete_failure(self, tmp_path):
+        """When ``dedupe=True`` and stale comments cannot be deleted, the
+        function must log a warning to stderr and still return ``keep_id``.
+
+        The PATCH to the highest-id comment succeeded, so the new state is
+        durably written. The warning lets operators diagnose residual stale
+        markers without treating a cleanup hiccup as a save failure.
+        """
+        mock_comments = _make_mock_comments(8, state_positions=[3, 6])
+
+        def side_effect(args, **kwargs):
+            cmd = list(args)
+            m = MagicMock(returncode=0, stdout="{}")
+            if "-X" not in cmd:
+                m.stdout = json.dumps(mock_comments)
+                return m
+            verb = cmd[cmd.index("-X") + 1]
+            if verb == "DELETE":
+                m.returncode = 1  # Simulate delete failure
+            return m
+
+        import io
+        stderr_capture = io.StringIO()
+
+        with patch("shutil.which", return_value="/usr/bin/gh"), \
+             patch("subprocess.run", side_effect=side_effect), \
+             patch("sys.stderr", stderr_capture):
+            returned_id = github_save_state(
+                "owner", "repo", 481, "bug",
+                {"last_completed_step": 6, "step_outputs": {}},
+                tmp_path,
+                comment_id=None,
+                dedupe=True,
+            )
+
+        # PATCH succeeded → keep_id returned even though delete failed
+        assert returned_id == 1006, (
+            f"Expected keep_id=1006 despite delete failure; got {returned_id!r}"
+        )
+        warning_text = stderr_capture.getvalue()
+        assert "could not be deleted" in warning_text, (
+            f"Expected delete-failure warning on stderr; got: {warning_text!r}"
+        )
+        assert "1003" in warning_text, (
+            f"Expected stale id 1003 named in warning; got: {warning_text!r}"
+        )

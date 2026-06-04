@@ -260,15 +260,26 @@ def create_app(
     create_websocket_routes(app, _app_state.connection_manager, _app_state.job_manager)
 
     # 4. Serve Frontend Static Files
-    # Look for frontend dist in the pdd package directory
-    frontend_dist = Path(__file__).parent.parent / "frontend" / "dist"
+    # Priority: local workspace (repo layout) > local workspace (flat) > installed package
+    import os
+    package_dist = Path(__file__).parent.parent / "frontend" / "dist"
+    _candidates = [
+        (project_root / "pdd" / "frontend" / "dist", "local development workspace"),
+        (project_root / "frontend" / "dist",          "local development workspace"),
+        (package_dist,                                 "installed package"),
+    ]
+    frontend_dist, frontend_source = next(
+        ((p, s) for p, s in _candidates if p.exists() and (p / "index.html").exists()),
+        (package_dist, "installed package"),
+    )
+
     if frontend_dist.exists():
-        console.print(f"[green]Serving frontend from:[/green] {frontend_dist}")
+        console.print(f"[green]Serving frontend from {frontend_source}:[/green] {frontend_dist}")
 
-        # Serve static assets (JS, CSS, etc.)
-        app.mount("/assets", StaticFiles(directory=frontend_dist / "assets"), name="assets")
+        assets_dir = frontend_dist / "assets"
+        if assets_dir.exists():
+            app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
 
-        # Serve index.html for the root and any non-API routes (SPA fallback)
         @app.get("/", response_class=HTMLResponse)
         async def serve_frontend():
             index_file = frontend_dist / "index.html"
@@ -276,27 +287,20 @@ def create_app(
                 return FileResponse(index_file)
             return HTMLResponse("<h1>Frontend not found</h1>", status_code=404)
 
-        # Catch-all for SPA routing (must be last)
         @app.get("/{path:path}")
         async def serve_spa_fallback(path: str):
-            # Don't intercept API, docs, or WebSocket routes
             if path.startswith(("api/", "docs", "redoc", "openapi.json", "ws/")):
                 return JSONResponse({"detail": "Not found"}, status_code=404)
-
-            # Try to serve the file directly first
             file_path = frontend_dist / path
             if file_path.exists() and file_path.is_file():
                 return FileResponse(file_path)
-
-            # Fall back to index.html for SPA routing
             index_file = frontend_dist / "index.html"
             if index_file.exists():
                 return FileResponse(index_file)
             return JSONResponse({"detail": "Not found"}, status_code=404)
     else:
-        console.print(f"[yellow]Frontend not found at {frontend_dist}[/yellow]")
+        console.print(f"[yellow]Frontend not found at {package_dist}[/yellow]")
         console.print("[yellow]Run 'npm run build' in pdd/frontend to build the frontend[/yellow]")
-
     return app
 
 

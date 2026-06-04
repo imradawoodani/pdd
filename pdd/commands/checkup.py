@@ -10,6 +10,7 @@ from ..agentic_checkup import run_agentic_checkup
 from ..agentic_sync import _is_github_issue_url
 from ..track_cost import track_cost
 from ..core.errors import handle_error
+from ..core.utils import echo_model_line
 
 
 @click.command("checkup")
@@ -47,6 +48,13 @@ from ..core.errors import handle_error
     help="Additional seconds to add to each step's timeout.",
 )
 @click.option(
+    "--start-step",
+    "start_step",
+    type=click.Choice(["1", "2", "3", "4", "5", "6.1", "6.2", "6.3", "7", "8"]),
+    default=None,
+    help="Recovery override: start the legacy checkup workflow from this step.",
+)
+@click.option(
     "--no-github-state",
     is_flag=True,
     default=False,
@@ -58,7 +66,9 @@ from ..core.errors import handle_error
     type=str,
     default=None,
     help=(
-        "PR-mode: verify this existing pull request instead of creating a new one. "
+        "PR-mode: run the full checkup against this existing pull request "
+        "instead of creating a new one. Unless --no-fix is set, eligible "
+        "generated fixes are committed and pushed back to the PR head ref. "
         "Requires --issue. TARGET must NOT be passed."
     ),
 )
@@ -70,6 +80,21 @@ from ..core.errors import handle_error
     help=(
         "PR-mode companion to --pr: the original GitHub issue the PR is meant to "
         "resolve. Used as issue context for verification."
+    ),
+)
+@click.option(
+    "--test-scope",
+    "test_scope",
+    type=click.Choice(["full", "targeted"]),
+    default="full",
+    show_default=True,
+    help=(
+        "PR-mode test scope. 'full' (default) runs the full discovered "
+        "test suite in Step 5 and Step 7. 'targeted' is an opt-in fast "
+        "path that passes PR changed-file context into Steps 5/7 so the "
+        "agent runs PR-scoped tests only; the final report explicitly "
+        "labels verification as targeted (full suite not run). Only "
+        "meaningful with --pr."
     ),
 )
 @click.option(
@@ -120,6 +145,19 @@ from ..core.errors import handle_error
     ),
 )
 @click.option(
+    "--fixer-fallback",
+    type=str,
+    default=None,
+    show_default=False,
+    help=(
+        "Optional secondary fixer role to invoke once if the primary fixer "
+        "cannot address the reviewer's findings (e.g. a subscription-tier "
+        "credential exhaustion such as Claude Code 'You've hit your limit "
+        "· resets …'). Must differ from --fixer and --reviewer to preserve "
+        "reviewer/fixer role independence."
+    ),
+)
+@click.option(
     "--max-review-rounds",
     type=int,
     default=5,
@@ -129,7 +167,7 @@ from ..core.errors import handle_error
 @click.option(
     "--max-review-cost",
     type=float,
-    default=10.0,
+    default=50.0,
     show_default=True,
     help="Maximum review-loop LLM cost in USD.",
 )
@@ -204,6 +242,49 @@ from ..core.errors import handle_error
         "verifier would collapse the reviewer/fixer independence."
     ),
 )
+@click.option(
+    "--no-gates",
+    "no_gates",
+    is_flag=True,
+    default=False,
+    help=(
+        "Disable the deterministic-gate enforcement layer (issue #1092). "
+        "By default the review loop discovers a conservative set of fast "
+        "local checks (prettier --check, git diff --check against the PR "
+        "range, a non-mutating Python syntax check, optional "
+        "ruff/black/mypy/tsc) and refuses a clean LLM verdict if "
+        "any of them fail on the PR worktree. Pass --no-gates to fall "
+        "back to LLM-only verdicts (legacy behavior); the loop will then "
+        "trust the reviewer's clean even if a deterministic check would "
+        "have failed locally."
+    ),
+)
+@click.option(
+    "--gate-timeout",
+    "gate_timeout",
+    type=float,
+    default=60.0,
+    show_default=True,
+    help=(
+        "Per-gate wall-clock timeout in seconds. A gate exceeding this "
+        "cap is recorded as a runner-side failure (exit_code=None) and "
+        "treated as a blocker finding rather than blocking the loop."
+    ),
+)
+@click.option(
+    "--gate-allow",
+    "gate_allow",
+    type=str,
+    multiple=True,
+    default=(),
+    help=(
+        "Repeatable. Forward-compatibility hook for opting extra gate "
+        "names into discovery beyond the conservative v1 set. Each "
+        "value is one gate name. Discovery remains allowlist-only; this "
+        "argument is threaded through so the CLI and discovery surfaces "
+        "can co-evolve without breaking signature stability."
+    ),
+)
 @click.pass_context
 @track_cost
 def checkup(
@@ -214,15 +295,18 @@ def checkup(
     strict: bool,
     no_fix: bool,
     timeout_adder: float,
+    start_step: Optional[str],
     no_github_state: bool,
     pr_url: Optional[str],
     issue_url_opt: Optional[str],
+    test_scope: str,
     review_loop: bool,
     review_only: bool,
     reviewers: str,
     reviewer: Optional[str],
     fixer: Optional[str],
     reviewer_fallback: Optional[str],
+    fixer_fallback: Optional[str],
     max_review_rounds: int,
     max_review_cost: float,
     max_review_minutes: float,
@@ -232,14 +316,20 @@ def checkup(
     blocking_severities: Optional[str],
     clean_reviewer_states: Optional[str],
     fallback_reviewer_on_failure: bool,
+    no_gates: bool,
+    gate_timeout: float,
+    gate_allow: Tuple[str, ...],
 ) -> Optional[Tuple[str, float, str]]:
     """
     Run agentic health checkup from a GitHub issue, or local diagnostics.
 
     \b
     GitHub mode (default): TARGET is an issue URL.
-    PR mode: pass --pr <pr-url> and --issue <issue-url> to verify an existing PR
-             against its source issue without creating a new PR.
+    PR mode: pass --pr <pr-url> and --issue <issue-url> to run the full
+             checkup against an existing PR. Unless --no-fix is set, the
+             fix/verify loop runs against the PR worktree and any eligible
+             generated fixes are committed and pushed back to the PR head
+             ref. Step 8 (create PR) is skipped — no second PR is opened.
     Local mode: pass --validate-arch-includes (no TARGET) to cross-validate
     architecture.json entries against module prompt <include> tags.
     """
@@ -259,10 +349,20 @@ def checkup(
 
     # PR-mode argument validation
     pr_mode = pr_url is not None or issue_url_opt is not None
+    if test_scope == "targeted" and not pr_mode:
+        raise click.BadParameter(
+            "--test-scope targeted requires --pr (PR mode).",
+            param_hint="'--test-scope'",
+        )
     if review_loop and not pr_mode:
         raise click.BadParameter(
             "--review-loop requires --pr and --issue.",
             param_hint="'--review-loop'",
+        )
+    if review_loop and start_step is not None:
+        raise click.BadParameter(
+            "--start-step applies to the legacy checkup workflow, not --review-loop.",
+            param_hint="'--start-step'",
         )
     if review_only and not review_loop:
         raise click.BadParameter(
@@ -312,22 +412,6 @@ def checkup(
                 "(e.g., https://github.com/org/repo/issues/123).",
                 param_hint="'--issue'",
             )
-        # PR mode without --no-fix would generate fix commits inside the
-        # PR-mode worktree (.pdd/worktrees/checkup-pr-N/) and never push
-        # them back to the PR — silently abandoning the work and confusing
-        # the user (who sees "Checkup complete" with no indication that
-        # fixes exist on a local branch). Push-back is a separate follow-up;
-        # until it lands, force --no-fix when --pr is set and warn so the
-        # user can re-invoke without --pr if they wanted fixes applied.
-        if not no_fix and not review_loop:
-            click.echo(
-                "Warning: --pr forces --no-fix because push-back to the PR "
-                "is not yet implemented. Generated fixes inside the PR "
-                "worktree would not reach the PR. Re-invoke without --pr "
-                "(or with an issue TARGET) to apply fixes.",
-                err=True,
-            )
-            no_fix = True
         effective_issue_url = issue_url_opt
     else:
         if not target:
@@ -349,6 +433,11 @@ def checkup(
 
     quiet = ctx.obj.get("quiet", False)
     verbose = ctx.obj.get("verbose", False)
+    start_step_override = None
+    if start_step is not None:
+        start_step_override = float(start_step)
+        if start_step_override.is_integer():
+            start_step_override = int(start_step_override)
 
     try:
         success, message, cost, model = run_agentic_checkup(
@@ -360,12 +449,15 @@ def checkup(
             use_github_state=not no_github_state,
             reasoning_time=ctx.obj.get("time") if ctx.obj.get("time_explicit") else None,
             pr_url=pr_url,
+            test_scope=test_scope,
+            start_step_override=start_step_override,
             review_loop=review_loop,
             review_only=review_only,
             reviewers=reviewers,
             reviewer=reviewer,
             fixer=fixer,
             reviewer_fallback=reviewer_fallback,
+            fixer_fallback=fixer_fallback,
             max_review_rounds=max_review_rounds,
             max_review_cost=max_review_cost,
             max_review_minutes=max_review_minutes,
@@ -375,6 +467,9 @@ def checkup(
             blocking_severities=blocking_severities,
             clean_reviewer_states=clean_reviewer_states,
             fallback_reviewer_on_failure=fallback_reviewer_on_failure,
+            enable_gates=not no_gates,
+            gate_timeout=gate_timeout,
+            gate_allow=tuple(gate_allow),
         )
 
         if not quiet:
@@ -382,7 +477,7 @@ def checkup(
             click.echo(f"Status: {status}")
             click.echo(f"Message: {message}")
             click.echo(f"Cost: ${cost:.4f}")
-            click.echo(f"Model: {model}")
+            echo_model_line(model)
 
         if not success:
             raise click.exceptions.Exit(1)

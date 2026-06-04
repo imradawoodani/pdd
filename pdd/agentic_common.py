@@ -14,7 +14,7 @@ import re
 import random
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict, Any, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from dataclasses import dataclass
 
 from rich.console import Console
@@ -386,6 +386,26 @@ _PERMANENT_ERROR_CLASSES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
             # misconfigurations classify as `provider-config` (their dedicated
             # class lower in this table), not as a bare invalid-parameter.
             r"model\s+not\s+found(?!\s+in\s+provider)",
+        ),
+    ),
+    (
+        # Issue (this PR): Claude Code subscription-tier weekly limit ("You've
+        # hit your limit · resets [TIME]"). Distinct from API-tier 429 because
+        # the reset window is hours-to-days, not seconds-to-minutes — retrying
+        # on the 60s rate-limit floor wastes minutes. Stable token
+        # `credential-limit` lets pdd_cloud's OAuth-token waterfall detect this
+        # and rotate to a different credential instead of retrying the dead one.
+        "credential-limit",
+        (
+            # Proximity + time-token guard. Requires "hit your limit" and
+            # "resets" within 40 chars (typical envelope is "... limit ·
+            # resets May 18, 11pm (UTC) ...") AND requires a time-token
+            # OR delimiter immediately after "resets" so distant prose
+            # like "if you hit your limit, nothing resets automatically"
+            # does NOT classify as credential-limit. Without the time
+            # token, any sentence stringing both phrases together would
+            # short-circuit the rate-limit retry path on benign text.
+            r"hit\s+your\s+limit[^\n]{0,40}?\bresets?\b\s*(?:[·:|\-]|in\s|at\s|on\s|\d|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)",
         ),
     ),
     (
@@ -2241,10 +2261,17 @@ def _revert_out_of_scope_changes(
     cwd_str = str(cwd.resolve())
     if not any(str(p).startswith(cwd_str) for p in allowed_paths):
         return []
+    # Use the structured ``--porcelain=v1 -z`` parser so staged renames
+    # surface BOTH the new and old paths as discrete fields. The earlier
+    # text-mode ``line[3:]`` parser collapsed renames into a literal
+    # ``"old -> new"`` path that ``git checkout HEAD -- <fake>`` never
+    # matched, so an out-of-scope rename silently survived the guard.
+    # See issue #1080.
+    from pdd.git_porcelain import parse_porcelain_z  # local import: avoid cycles
     try:
         result = subprocess.run(
-            ["git", "-C", str(cwd), "status", "--porcelain", "-uno"],
-            capture_output=True, text=True, timeout=30,
+            ["git", "-C", str(cwd), "status", "--porcelain=v1", "-z", "-uno"],
+            capture_output=True, timeout=30,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
         _scope_guard_logger.warning("Scope guard: git status failed: %s", exc)
@@ -2252,38 +2279,82 @@ def _revert_out_of_scope_changes(
     if result.returncode != 0:
         _scope_guard_logger.warning(
             "Scope guard: git status returned %d: %s",
-            result.returncode, result.stderr.strip(),
+            result.returncode, result.stderr.decode("utf-8", errors="replace").strip(),
         )
         return []
+    entries = parse_porcelain_z(result.stdout)
     reverted: List[Path] = []
-    to_restore: List[str] = []
-    for line in result.stdout.splitlines():
-        if len(line) < 4:
+    paths_to_checkout: List[str] = []  # paths to restore from HEAD
+    paths_to_reset: List[str] = []     # paths to unstage from the index
+    paths_to_unlink: List[str] = []    # paths to remove from the worktree
+    for entry in entries:
+        new_resolved = (cwd / entry.path).resolve()
+        is_rename = entry.old_path is not None and "R" in entry.status
+        is_copy = entry.old_path is not None and "C" in entry.status
+        if is_rename:
+            old_resolved = (cwd / entry.old_path).resolve()
+            in_scope = (
+                new_resolved in allowed_paths
+                and old_resolved in allowed_paths
+            )
+        elif is_copy:
+            in_scope = new_resolved in allowed_paths
+        else:
+            in_scope = new_resolved in allowed_paths
+        if in_scope:
             continue
-        rel_path = line[3:].strip()
-        full_path = (cwd / rel_path).resolve()
-        if full_path not in allowed_paths:
-            to_restore.append(rel_path)
-            reverted.append(full_path)
-    if to_restore:
-        try:
+        if is_rename:
+            # Rename: restore old path from HEAD, unstage + delete new path.
+            paths_to_checkout.append(entry.old_path)
+            paths_to_reset.extend([entry.path, entry.old_path])
+            paths_to_unlink.append(entry.path)
+            reverted.append(old_resolved)
+            reverted.append(new_resolved)
+        elif is_copy:
+            # Copy: only the destination is changed. The source old_path
+            # is informational and must not be reset, checked out, or
+            # reported as reverted.
+            paths_to_reset.append(entry.path)
+            paths_to_unlink.append(entry.path)
+            reverted.append(new_resolved)
+        else:
+            paths_to_checkout.append(entry.path)
+            reverted.append(new_resolved)
+    if not reverted:
+        return reverted
+    try:
+        if paths_to_reset:
             subprocess.run(
-                ["git", "-C", str(cwd), "checkout", "HEAD", "--"] + to_restore,
+                ["git", "-C", str(cwd), "reset", "HEAD", "--"] + paths_to_reset,
                 capture_output=True, timeout=30,
             )
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
-            _scope_guard_logger.warning(
-                "Scope guard: git checkout failed for %d file(s): %s",
-                len(to_restore), exc,
+        if paths_to_checkout:
+            subprocess.run(
+                ["git", "-C", str(cwd), "checkout", "HEAD", "--"] + paths_to_checkout,
+                capture_output=True, timeout=30,
             )
-            reverted.clear()
-        else:
-            if reverted:
-                _scope_guard_logger.info(
-                    "Scope guard reverted %d out-of-scope file(s): %s",
-                    len(reverted),
-                    ", ".join(str(p.name) for p in reverted[:10]),
+        for rel in paths_to_unlink:
+            try:
+                (cwd / rel).unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                _scope_guard_logger.warning(
+                    "Scope guard: failed to remove %s: %s", rel, exc,
                 )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        _scope_guard_logger.warning(
+            "Scope guard: git revert failed for %d file(s): %s",
+            len(reverted), exc,
+        )
+        reverted.clear()
+    else:
+        if reverted:
+            _scope_guard_logger.info(
+                "Scope guard reverted %d out-of-scope file(s): %s",
+                len(reverted),
+                ", ".join(str(p.name) for p in reverted[:10]),
+            )
     return reverted
 
 _CLAUDE_OAUTH_PROBE_TIMEOUT_SECONDS = 10
@@ -2667,7 +2738,7 @@ def _run_with_provider(
             "exec",
             "--sandbox", sandbox_mode,
             "--json",
-            str(prompt_path)
+            "-"
         ])
         # Allow model override via CODEX_MODEL env var (mirrors CLAUDE_MODEL for anthropic)
         codex_model = env.get("CODEX_MODEL")
@@ -2723,10 +2794,11 @@ def _run_with_provider(
     else:
         return False, f"Unknown provider {provider}", 0.0, None
 
-    # For anthropic, pipe prompt content via stdin; others use file path in cmd.
+    # Claude and Codex both support stdin. Passing the prompt path as Codex's
+    # positional argument makes the path string the prompt, not the file body.
     # OpenCode reads the prompt from the file referenced in the trailing
     # message argv, so it does NOT receive the body via stdin.
-    stdin_content = prompt_content if provider == "anthropic" else None
+    stdin_content = prompt_content if provider in {"anthropic", "openai"} else None
 
     try:
         result = _subprocess_run(
@@ -3073,11 +3145,46 @@ def _parse_state_from_comment(body: str, workflow_type: str, issue_number: int) 
     except (json.JSONDecodeError, ValueError):
         return None
 
+
+def _flatten_comment_pages(payload: Any) -> List[Dict]:
+    """Flatten GitHub comment payloads from one page or slurped pages."""
+    comments: List[Dict] = []
+    if isinstance(payload, dict):
+        comments.append(payload)
+    elif isinstance(payload, list):
+        for item in payload:
+            comments.extend(_flatten_comment_pages(item))
+    return comments
+
+
+def _load_gh_paginated_comments(stdout: str) -> List[Dict]:
+    """Parse comments emitted by ``gh api --paginate`` with or without slurp."""
+    text = stdout.strip()
+    if not text:
+        return []
+
+    try:
+        return _flatten_comment_pages(json.loads(text))
+    except json.JSONDecodeError:
+        pass
+
+    decoder = json.JSONDecoder()
+    index = 0
+    comments: List[Dict] = []
+    while index < len(text):
+        while index < len(text) and text[index].isspace():
+            index += 1
+        if index >= len(text):
+            break
+        payload, index = decoder.raw_decode(text, index)
+        comments.extend(_flatten_comment_pages(payload))
+    return comments
+
 def _find_state_comment(
-    repo_owner: str, 
-    repo_name: str, 
-    issue_number: int, 
-    workflow_type: str, 
+    repo_owner: str,
+    repo_name: str,
+    issue_number: int,
+    workflow_type: str,
     cwd: Path
 ) -> Optional[Tuple[int, Dict]]:
     """
@@ -3092,43 +3199,121 @@ def _find_state_comment(
             "gh", "api",
             f"repos/{repo_owner}/{repo_name}/issues/{issue_number}/comments",
             "--method", "GET",
-            "--paginate"
+            "--paginate",
+            "--slurp",
         ]
         result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
         if result.returncode != 0:
             return None
-            
-        comments = json.loads(result.stdout)
+
+        comments = _load_gh_paginated_comments(result.stdout)
         marker = _build_state_marker(workflow_type, issue_number)
-        
+
+        best: Optional[Tuple[int, Dict]] = None
         for comment in comments:
             body = comment.get("body", "")
             if marker in body:
                 state = _parse_state_from_comment(body, workflow_type, issue_number)
                 if state:
-                    return comment["id"], state
-                    
-        return None
+                    cid = comment["id"]
+                    if best is None or cid > best[0]:
+                        best = (cid, state)
+        return best
     except Exception:
         return None
 
+
+def _find_all_state_comments(
+    repo_owner: str,
+    repo_name: str,
+    issue_number: int,
+    workflow_type: str,
+    cwd: Path,
+) -> List[int]:
+    """Return EVERY GitHub comment id whose body contains this workflow's
+    state marker, in the order GitHub returned them.
+
+    The legacy ``_find_state_comment`` returns only the first match, which
+    is fine for the happy path where there is exactly one state comment.
+    Issue #1149 surfaced a duplicate-marker hazard: if two workers race
+    on first-save and both POST a fresh state comment, or a prior run's
+    state was never fully cleared, two valid-looking comments coexist.
+    A future normal resume's ``_find_state_comment`` will load whichever
+    one GitHub ranks first — usually the OLDER one — silently resuming
+    against stale step outputs. Callers that need to deduplicate (clean
+    restart pre-clear, or save's first-write dedupe path) must use this
+    helper, not the singleton variant.
+    """
+    if not _find_cli_binary("gh"):
+        return []
+
+    try:
+        cmd = [
+            "gh", "api",
+            f"repos/{repo_owner}/{repo_name}/issues/{issue_number}/comments",
+            "--method", "GET",
+            "--paginate",
+            "--slurp",
+        ]
+        result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+        if result.returncode != 0:
+            return []
+        comments = _load_gh_paginated_comments(result.stdout)
+        marker = _build_state_marker(workflow_type, issue_number)
+        ids: List[int] = []
+        for comment in comments:
+            body = comment.get("body", "")
+            if marker in body and comment.get("id") is not None:
+                ids.append(int(comment["id"]))
+        return ids
+    except Exception:
+        return []
+
+
+def _github_delete_comment(repo_owner: str, repo_name: str, comment_id: int, cwd: Path) -> bool:
+    """Delete one issue comment by id via ``gh api``. Best-effort, never raises."""
+    if not _find_cli_binary("gh"):
+        return False
+    try:
+        cmd = [
+            "gh", "api",
+            f"repos/{repo_owner}/{repo_name}/issues/comments/{comment_id}",
+            "-X", "DELETE",
+        ]
+        res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
 def github_save_state(
-    repo_owner: str, 
-    repo_name: str, 
-    issue_number: int, 
-    workflow_type: str, 
-    state: Dict, 
-    cwd: Path, 
-    comment_id: Optional[int] = None
+    repo_owner: str,
+    repo_name: str,
+    issue_number: int,
+    workflow_type: str,
+    state: Dict,
+    cwd: Path,
+    comment_id: Optional[int] = None,
+    *,
+    dedupe: bool = False,
 ) -> Optional[int]:
     """
     Creates or updates a GitHub comment with the state. Returns new/existing comment_id.
+
+    When ``dedupe=True`` and ``comment_id is None`` (i.e. this is the
+    session's first save and we have no prior id to PATCH), the helper
+    first lists ALL comments carrying this workflow's state marker. If
+    one or more already exist, it PATCHes the most-recent (highest id)
+    in place and DELETEs the rest, returning the PATCHed id. This closes
+    the duplicate-marker hazard described on ``_find_all_state_comments``
+    in cases where a concurrent worker re-created a state comment in the
+    gap between a clean-restart pre-clear and this save.
     """
     if not _find_cli_binary("gh"):
         return None
 
     body = _serialize_state_comment(workflow_type, issue_number, state)
-    
+
     try:
         if comment_id:
             # PATCH existing
@@ -3142,6 +3327,39 @@ def github_save_state(
             if res.returncode == 0:
                 return comment_id
         else:
+            existing_ids: List[int] = []
+            if dedupe:
+                existing_ids = _find_all_state_comments(
+                    repo_owner, repo_name, issue_number, workflow_type, cwd
+                )
+
+            if existing_ids:
+                # Adopt the most recent comment (GitHub assigns monotonically
+                # increasing ids), PATCH it in place, and delete the rest.
+                keep_id = max(existing_ids)
+                cmd = [
+                    "gh", "api",
+                    f"repos/{repo_owner}/{repo_name}/issues/comments/{keep_id}",
+                    "-X", "PATCH",
+                    "-f", f"body={body}",
+                ]
+                res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+                if res.returncode != 0:
+                    return None
+                failed_ids = [
+                    stale_id for stale_id in existing_ids
+                    if stale_id != keep_id
+                    and not _github_delete_comment(repo_owner, repo_name, stale_id, cwd)
+                ]
+                if failed_ids:
+                    print(
+                        f"[pdd] github_save_state: {len(failed_ids)} stale state "
+                        f"comment(s) for issue #{issue_number} could not be deleted: "
+                        f"{failed_ids}",
+                        file=sys.stderr,
+                    )
+                return keep_id
+
             # POST new
             cmd = [
                 "gh", "api",
@@ -3153,7 +3371,7 @@ def github_save_state(
             if res.returncode == 0:
                 data = json.loads(res.stdout)
                 return data.get("id")
-                
+
         return None
     except Exception:
         return None
@@ -3174,30 +3392,32 @@ def github_load_state(
     return None, None
 
 def github_clear_state(
-    repo_owner: str, 
-    repo_name: str, 
-    issue_number: int, 
-    workflow_type: str, 
-    cwd: Path
+    repo_owner: str,
+    repo_name: str,
+    issue_number: int,
+    workflow_type: str,
+    cwd: Path,
 ) -> bool:
     """
-    Deletes the state comment if it exists.
+    Deletes EVERY GitHub comment carrying this workflow's state marker.
+
+    Previously this helper deleted only the first matching comment
+    (whichever ``_find_state_comment`` returned). That left any older /
+    duplicate state markers behind, so a subsequent normal resume could
+    load a stale state and silently start from the wrong step. Sweeping
+    all matches is safe because there should never legitimately be more
+    than one state comment per (issue, workflow); when there are, both
+    are equally untrustworthy and the next save will repost a fresh one.
     """
-    result = _find_state_comment(repo_owner, repo_name, issue_number, workflow_type, cwd)
-    if not result:
-        return True # Already clear
-        
-    comment_id = result[0]
-    try:
-        cmd = [
-            "gh", "api",
-            f"repos/{repo_owner}/{repo_name}/issues/comments/{comment_id}",
-            "-X", "DELETE"
-        ]
-        subprocess.run(cmd, cwd=cwd, capture_output=True)
-        return True
-    except Exception:
-        return False
+    ids = _find_all_state_comments(repo_owner, repo_name, issue_number, workflow_type, cwd)
+    if not ids:
+        return True  # Already clear
+
+    all_deleted = True
+    for cid in ids:
+        if not _github_delete_comment(repo_owner, repo_name, cid, cwd):
+            all_deleted = False
+    return all_deleted
 
 def _should_use_github_state(use_github_state: bool) -> bool:
     if not use_github_state:
@@ -3317,22 +3537,33 @@ def load_workflow_state(
     return None, None
 
 def save_workflow_state(
-    cwd: Path, 
-    issue_number: int, 
-    workflow_type: str, 
-    state: Dict, 
-    state_dir: Path, 
-    repo_owner: str, 
-    repo_name: str, 
-    use_github_state: bool = True, 
-    github_comment_id: Optional[int] = None
+    cwd: Path,
+    issue_number: int,
+    workflow_type: str,
+    state: Dict,
+    state_dir: Path,
+    repo_owner: str,
+    repo_name: str,
+    use_github_state: bool = True,
+    github_comment_id: Optional[int] = None,
+    *,
+    dedupe: bool = False,
 ) -> Optional[int]:
     """
     Saves state to local file and GitHub.
     Returns updated github_comment_id.
+
+    Pass ``dedupe=True`` when the caller has reason to suspect duplicate
+    state markers may have appeared (e.g. clean restart, where a
+    concurrent worker could have re-created a state comment between the
+    pre-clear sweep and this save). When set AND ``github_comment_id``
+    is None, the save path finds ALL existing state comments for this
+    (issue, workflow), PATCHes the most-recent in place, and DELETEs the
+    rest — converging to exactly one state comment regardless of prior
+    races.
     """
     local_file = state_dir / f"{workflow_type}_state_{issue_number}.json"
-    
+
     # 1. Save Local (atomic: write to tmp then rename)
     try:
         state_dir.mkdir(parents=True, exist_ok=True)
@@ -3346,7 +3577,8 @@ def save_workflow_state(
     # 2. Save GitHub
     if _should_use_github_state(use_github_state):
         new_id = github_save_state(
-            repo_owner, repo_name, issue_number, workflow_type, state, cwd, github_comment_id
+            repo_owner, repo_name, issue_number, workflow_type, state, cwd,
+            github_comment_id, dedupe=dedupe,
         )
         if new_id:
             return new_id
@@ -3382,6 +3614,206 @@ def clear_workflow_state(
         github_clear_state(repo_owner, repo_name, issue_number, workflow_type, cwd)
 
 
+# ---------------------------------------------------------------------------
+# Step-comment helpers (issue #964)
+#
+# Models used to post per-step GitHub issue comments themselves via shell
+# commands embedded in their prompts. This is unreliable across providers (in
+# particular Gemini's sandboxed shell cannot read GH_TOKEN). The orchestrator
+# now owns these writes: providers emit a delimited `<step_report>…
+# </step_report>` block that the orchestrator extracts, sanitizes, truncates,
+# and posts via `post_step_comment(body=…)` using trusted credentials.
+# ---------------------------------------------------------------------------
+
+_STEP_REPORT_RE = re.compile(
+    r"<step_report>(.*?)</step_report>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+_SECRET_PATTERNS: Tuple[Tuple["re.Pattern[str]", str], ...] = (
+    (re.compile(r"\bghp_[A-Za-z0-9]{20,}"),                "[REDACTED_GITHUB_TOKEN]"),
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),        "[REDACTED_GITHUB_TOKEN]"),
+    (re.compile(r"\b(?:gho_|ghu_|ghs_|ghr_)[A-Za-z0-9]{20,}"), "[REDACTED_GITHUB_TOKEN]"),
+    (re.compile(r"\bAIza[A-Za-z0-9_\-]{20,}"),             "[REDACTED_GOOGLE_API_KEY]"),
+    (re.compile(r"\bxai-[A-Za-z0-9]{20,}"),                "[REDACTED_XAI_KEY]"),
+    (re.compile(r"\bsk-[A-Za-z0-9_\-]{20,}"),              "[REDACTED_OPENAI_KEY]"),
+    (re.compile(r"\bgsk_[A-Za-z0-9]{20,}"),                "[REDACTED_GROQ_KEY]"),
+)
+
+_ENV_TOKEN_RE    = re.compile(r"\b(GH_TOKEN|GITHUB_TOKEN)\s*=\s*\S+")
+_BEARER_TOKEN_RE = re.compile(r"(Authorization:\s*Bearer\s+)\S+", re.IGNORECASE)
+
+_COMMENT_MAX_CHARS = 25_000
+_TRUNCATED_MARKER = "\n\n…[truncated]"
+
+
+def _extract_step_report(text: Optional[str]) -> Optional[str]:
+    """Extract the LAST ``<step_report>…</step_report>`` block from text.
+
+    Returns ``None`` if the input is empty or no tagged block is present. The
+    extracted body has surrounding whitespace stripped so callers can rely on a
+    clean payload. The regex is DOTALL + case-insensitive so the body can span
+    multiple lines and providers can emit ``<STEP_REPORT>`` if they choose.
+    """
+    if not text:
+        return None
+    matches = _STEP_REPORT_RE.findall(text)
+    if not matches:
+        return None
+    return matches[-1].strip()
+
+
+# Public alias for orchestrator callers; same semantics as ``_extract_step_report``.
+extract_step_report = _extract_step_report
+
+
+def normalize_step_comments_state(raw: Any) -> Set[int]:
+    """Coerce a persisted ``state["step_comments"]`` value into ``Set[int]``.
+
+    Accepts every shape that has ever been persisted:
+
+    * ``None`` / missing key            -> empty set.
+    * ``list`` / ``tuple`` of ints      -> set of those ints.
+    * ``set`` / ``frozenset``           -> defensive copy of int members.
+    * Legacy bug-orchestrator dict, e.g.
+      ``{"1": {"posted": True}, "2": {"failed_posted": True}}``
+      -> set of int step numbers whose ``posted`` *or* ``failed_posted`` flag
+      is truthy. Pending shapes (``fallback_pending`` / ``failed_pending``)
+      are skipped so the orchestrator retries them on resume.
+    * Malformed or unexpected inputs    -> empty set (never raises).
+
+    ``bool`` is rejected even though it's an ``int`` subclass — the legacy
+    dict shape uses booleans as flag values, not step numbers. ``float`` is
+    rejected too — orchestrators with fractional steps must project them
+    through a composite-key helper before storing.
+    """
+    if raw is None:
+        return set()
+    if isinstance(raw, dict):
+        out: Set[int] = set()
+        for key, value in raw.items():
+            try:
+                step = int(key)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(value, dict):
+                if value.get("posted") is True or value.get("failed_posted") is True:
+                    out.add(step)
+            elif value is True:
+                out.add(step)
+        return out
+    if isinstance(raw, (list, tuple, set, frozenset)):
+        out = set()
+        for item in raw:
+            if isinstance(item, bool):
+                continue
+            if isinstance(item, int):
+                out.add(item)
+                continue
+            if isinstance(item, str):
+                try:
+                    out.add(int(item))
+                except ValueError:
+                    continue
+        return out
+    return set()
+
+
+def post_step_comment_once(
+    *,
+    repo_owner: str,
+    repo_name: str,
+    issue_number: int,
+    step_num: int,
+    body: str,
+    posted_steps: Set[int],
+    cwd: Path,
+) -> bool:
+    """Post a per-step success comment via ``gh issue comment``, exactly once.
+
+    Idempotent: if ``step_num`` is already in ``posted_steps``, returns
+    ``True`` immediately without invoking ``gh``. On a successful new post
+    it mutates ``posted_steps`` in place (adds ``step_num``).
+
+    Args:
+        repo_owner: GitHub owner / org slug.
+        repo_name: GitHub repository name.
+        issue_number: Target issue number.
+        step_num: Integer key that uniquely identifies this step within the
+            workflow. Orchestrators with fractional or iterated steps must
+            project their (step_num, iteration) tuples to a deterministic
+            int before calling — the helper is ``Set[int]``-typed.
+        body: Pre-built comment body. The helper applies its own redaction
+            and truncation pass before shelling out; callers don't need to
+            sanitize first.
+        posted_steps: In-memory ``Set[int]`` of step keys already posted.
+            Mutated in place on a successful new post.
+        cwd: Working directory for the ``gh`` subprocess.
+
+    Returns:
+        ``True`` on success-or-already-posted, ``False`` on missing CLI or
+        ``gh`` non-zero exit. Never raises; transient failures are logged
+        via ``console.print`` and surfaced as ``False``.
+    """
+    if step_num in posted_steps:
+        return True
+    if not _find_cli_binary("gh"):
+        return False
+    final_body = _sanitize_comment_body(body)
+    try:
+        result = subprocess.run(
+            [
+                "gh", "issue", "comment", str(issue_number),
+                "--repo", f"{repo_owner}/{repo_name}",
+                "--body", final_body,
+            ],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            console.print(
+                f"[yellow]Warning: Failed to post step comment for step {step_num}: "
+                f"{result.stderr}[/yellow]"
+            )
+            return False
+    except Exception as exc:  # pylint: disable=broad-except
+        console.print(
+            f"[yellow]Warning: Failed to post step comment for step {step_num}: "
+            f"{exc}[/yellow]"
+        )
+        return False
+    posted_steps.add(step_num)
+    return True
+
+
+def _sanitize_comment_body(
+    body: Optional[str],
+    max_chars: int = _COMMENT_MAX_CHARS,
+) -> str:
+    """Redact known secret formats and truncate the body.
+
+    Idempotent and conservative: only patterns that look like credentials are
+    rewritten, and the function never raises. Truncation happens AFTER redaction
+    so a secret near the end of an oversized payload still gets scrubbed.
+    """
+    if not body:
+        return body or ""
+    redacted = body
+    for pat, repl in _SECRET_PATTERNS:
+        redacted = pat.sub(repl, redacted)
+    redacted = _ENV_TOKEN_RE.sub(lambda m: f"{m.group(1)}=[REDACTED]", redacted)
+    redacted = _BEARER_TOKEN_RE.sub(lambda m: f"{m.group(1)}[REDACTED]", redacted)
+    if len(redacted) > max_chars:
+        # Reserve room for the marker so the returned length never exceeds the
+        # caller-supplied cap (codex review of PR #966). When max_chars is
+        # smaller than the marker itself, the marker won't fit either — the
+        # final slice enforces the cap unconditionally.
+        keep = max(0, max_chars - len(_TRUNCATED_MARKER))
+        redacted = (redacted[:keep] + _TRUNCATED_MARKER)[:max_chars]
+    return redacted
+
+
 def post_step_comment(
     repo_owner: str,
     repo_name: str,
@@ -3391,59 +3823,87 @@ def post_step_comment(
     description: str,
     output: str,
     cwd: Path,
+    body: Optional[str] = None,
 ) -> bool:
-    """
-    Post a fallback comment on a GitHub issue when a step fails.
+    """Post a per-step GitHub issue comment.
 
-    When the LLM agent fails (e.g., all providers unavailable), the agent never
-    runs and therefore never posts its own step comment. This function posts a
-    fallback comment so users can see which steps failed and why.
+    Two modes:
+
+    1. ``body is None`` (legacy / fallback path): used by orchestrators when
+       the LLM agent itself failed and therefore could not produce a report.
+       The body is the historical FAILED template, kept verbatim for backwards
+       compatibility with existing callers (e.g. ``agentic_change_orchestrator``
+       hard-stop paths).
+    2. ``body is not None``: the orchestrator extracted a ``<step_report>``
+       block from a successful run. The body is sanitized + truncated by the
+       orchestrator's pipeline; here we additionally strip any leading
+       duplicate ``## Step N`` header the model emitted and prepend our own
+       canonical header so framing is consistent regardless of provider.
 
     Args:
-        repo_owner: GitHub repository owner
-        repo_name: GitHub repository name
-        issue_number: Issue number to comment on
-        step_num: Current step number
-        total_steps: Total number of steps in the workflow
-        description: Human-readable step description
-        output: Error output / failure details
-        cwd: Working directory for subprocess
+        repo_owner: GitHub repository owner.
+        repo_name: GitHub repository name.
+        issue_number: Issue number to comment on.
+        step_num: Current step number.
+        total_steps: Total number of steps in the workflow.
+        description: Human-readable step description (used in the header).
+        output: Raw provider output (still used for the FAILED fallback path).
+        cwd: Working directory for the ``gh`` subprocess.
+        body: Optional pre-extracted, model-supplied report body. When set,
+            takes precedence over the FAILED template.
 
     Returns:
-        True if comment was posted successfully, False otherwise
+        True if the comment posted successfully, False otherwise (including
+        when ``gh`` is not on PATH).
     """
     if not _find_cli_binary("gh"):
         return False
 
-    # Truncate output to avoid exceeding GitHub comment size limits
-    error_detail = output[:1000] if len(output) > 1000 else output
-
-    body = (
-        f"## Step {step_num}/{total_steps}: {description}\n\n"
-        f"**Status:** FAILED\n\n"
-        f"### Error Details\n"
-        f"```\n{error_detail}\n```\n\n"
-        f"---\n"
-        f"*Automated fallback comment — agent did not execute for this step.*"
-    )
+    if body is None:
+        # Backwards-compatible fallback for agent-execution failures.
+        error_detail = _sanitize_comment_body(output or "", max_chars=1000)
+        final_body = (
+            f"## Step {step_num}/{total_steps}: {description}\n\n"
+            f"**Status:** FAILED\n\n"
+            f"### Error Details\n"
+            f"```\n{error_detail}\n```\n\n"
+            f"---\n"
+            f"*Automated fallback comment — agent did not execute for this step.*"
+        )
+    else:
+        # Strip a single leading duplicate "## Step <N>..." line so the
+        # orchestrator's canonical header isn't shadowed. Only the FIRST
+        # occurrence is removed — interior headers (e.g. inside a fenced
+        # block summarising another step) are preserved.
+        leading_dup_re = re.compile(
+            rf"^\s*##\s+Step\s+{re.escape(str(step_num))}\b[^\n]*\n+",
+        )
+        stripped = leading_dup_re.sub("", body, count=1)
+        sanitized = _sanitize_comment_body(stripped)
+        final_body = (
+            f"## Step {step_num}/{total_steps}: {description}\n\n"
+            f"{sanitized}\n\n"
+            f"---\n"
+            f"*Posted by PDD orchestrator (trusted credentials).*"
+        )
 
     try:
         result = subprocess.run(
             [
                 "gh", "issue", "comment", str(issue_number),
                 "--repo", f"{repo_owner}/{repo_name}",
-                "--body", body,
+                "--body", final_body,
             ],
             cwd=cwd,
             capture_output=True,
             text=True,
         )
         if result.returncode != 0:
-            console.print(f"[yellow]Warning: Failed to post fallback comment for step {step_num}: {result.stderr}[/yellow]")
+            console.print(f"[yellow]Warning: Failed to post comment for step {step_num}: {result.stderr}[/yellow]")
             return False
         return True
     except Exception as e:
-        console.print(f"[yellow]Warning: Failed to post fallback comment for step {step_num}: {e}[/yellow]")
+        console.print(f"[yellow]Warning: Failed to post comment for step {step_num}: {e}[/yellow]")
         return False
 
 
